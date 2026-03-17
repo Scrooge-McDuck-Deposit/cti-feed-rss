@@ -1,0 +1,15 @@
+# Backend - CTI Feed RSS
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+aiohttp>=3.9.0
+feedparser>=6.0.0
+beautifulsoup4>=4.12.0
+stix2>=3.0.0
+python-dotenv>=1.0.0
+
+# AI engines (installare solo quello che si usa)
+# openai>=1.6.0        # pip install openai (solo per engine OpenAI)
+# google-generativeai  # non necessario: Gemini usa API REST direttamente
+# Ollama: nessun pacchetto necessario, usa API REST locale

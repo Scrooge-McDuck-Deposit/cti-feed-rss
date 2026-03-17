@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+*.egg
+dist/
+build/
+
+# Environment
+.env
+.env.local
+
+# Cache
+cache/
+*.db
+
+# Node / React Native
+node_modules/
+mobile/node_modules/
+.expo/
+mobile/.expo/
+npm-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
