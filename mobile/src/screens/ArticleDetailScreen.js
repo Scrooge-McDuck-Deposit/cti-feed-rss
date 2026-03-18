@@ -36,17 +36,85 @@ export default function ArticleDetailScreen({ route }) {
     selectArticle,
     analyzeArticle,
     generateReport,
+    toggleFavorite,
+    isFavorite,
+    excludeSource,
   } = useStore();
 
   const [activeTab, setActiveTab] = useState('summary');
   const [analyzing, setAnalyzing] = useState(false);
+  const [autoAnalyzing, setAutoAnalyzing] = useState(false);
   const [generatingReport, setGeneratingReport] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [exporting, setExporting] = useState(null);
+  const [showActions, setShowActions] = useState(false);
+  const [actionItems, setActionItems] = useState([]);
+  const [loadingActions, setLoadingActions] = useState(false);
+  const [isFav, setIsFav] = useState(false);
 
   useEffect(() => {
     selectArticle(articleId);
   }, [articleId]);
+
+  // Check favorite status
+  useEffect(() => {
+    setIsFav(isFavorite(articleId));
+  }, [articleId, useStore.getState().favorites]);
+
+  // Auto-analyze when article is loaded but not yet analyzed
+  useEffect(() => {
+    if (article && article.id === articleId && article.status !== 'analyzed' && !autoAnalyzing && !analyzing) {
+      setAutoAnalyzing(true);
+      analyzeArticle(articleId)
+        .catch(() => {})
+        .finally(() => setAutoAnalyzing(false));
+    }
+  }, [article, articleId]);
+
+  const handleToggleFavorite = useCallback(async () => {
+    await toggleFavorite(articleId);
+    setIsFav(!isFav);
+  }, [articleId, isFav]);
+
+  const handleShowActions = useCallback(async () => {
+    if (showActions) {
+      setShowActions(false);
+      return;
+    }
+    setLoadingActions(true);
+    setShowActions(true);
+    try {
+      const data = await apiService.getArticleActions(articleId);
+      setActionItems(data.actions || []);
+    } catch (error) {
+      setActionItems([{ priority: 'low', icon: 'alert-circle', action: 'Impossibile caricare le azioni' }]);
+    } finally {
+      setLoadingActions(false);
+    }
+  }, [articleId, showActions]);
+
+  const handleExcludeSource = useCallback(() => {
+    if (!article) return;
+    Alert.alert(
+      'Disabilita Sorgente',
+      `Vuoi disabilitare il feed "${article.feed_name || article.feed_id}"? Gli articoli da questa sorgente non appariranno più.`,
+      [
+        { text: 'Annulla', style: 'cancel' },
+        {
+          text: 'Disabilita',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await excludeSource(article.feed_id);
+              Alert.alert('Fatto', 'Sorgente disabilitata. Puoi riabilitarla dalle Impostazioni.');
+            } catch (error) {
+              Alert.alert('Errore', error.message || 'Impossibile disabilitare la sorgente');
+            }
+          },
+        },
+      ]
+    );
+  }, [article]);
 
   const handleAnalyze = useCallback(async () => {
     setAnalyzing(true);
@@ -152,6 +220,8 @@ export default function ArticleDetailScreen({ route }) {
   const analysis = article.analysis;
   const hasAnalysis = article.status === 'analyzed' && analysis;
 
+  const isCurrentlyAnalyzing = analyzing || autoAnalyzing;
+
   const tabs = [
     { id: 'summary', label: 'Riassunto', icon: 'document-text-outline' },
     { id: 'ioc', label: 'IoC', icon: 'bug-outline' },
@@ -215,19 +285,31 @@ export default function ArticleDetailScreen({ route }) {
 
         {/* Action Buttons */}
         <View style={styles.actionRow}>
+          {/* Favorite button */}
+          <TouchableOpacity
+            style={[styles.iconButton, isFav && { backgroundColor: colors.warning + '30' }]}
+            onPress={handleToggleFavorite}
+          >
+            <Ionicons
+              name={isFav ? 'bookmark' : 'bookmark-outline'}
+              size={20}
+              color={isFav ? colors.warning : colors.primary}
+            />
+          </TouchableOpacity>
+
           {!hasAnalysis && (
             <TouchableOpacity
               style={styles.analyzeButton}
               onPress={handleAnalyze}
-              disabled={analyzing}
+              disabled={isCurrentlyAnalyzing}
             >
-              {analyzing ? (
+              {isCurrentlyAnalyzing ? (
                 <ActivityIndicator size="small" color={colors.white} />
               ) : (
                 <Ionicons name="sparkles" size={16} color={colors.white} />
               )}
               <Text style={styles.analyzeButtonText}>
-                {analyzing ? 'Analisi in corso...' : 'Analizza con AI'}
+                {isCurrentlyAnalyzing ? 'Analisi in corso...' : 'Analizza con AI'}
               </Text>
             </TouchableOpacity>
           )}
@@ -248,6 +330,14 @@ export default function ArticleDetailScreen({ route }) {
               </Text>
             </TouchableOpacity>
           )}
+
+          {/* Action Items button */}
+          <TouchableOpacity
+            style={[styles.iconButton, showActions && { backgroundColor: colors.success + '30' }]}
+            onPress={handleShowActions}
+          >
+            <Ionicons name="list-outline" size={20} color={showActions ? colors.success : colors.primary} />
+          </TouchableOpacity>
 
           <TouchableOpacity style={styles.iconButton} onPress={handleShare}>
             <Ionicons name="share-outline" size={20} color={colors.primary} />
@@ -273,6 +363,46 @@ export default function ArticleDetailScreen({ route }) {
             </TouchableOpacity>
           )}
         </View>
+
+        {/* Exclude Source button */}
+        <TouchableOpacity
+          style={styles.excludeSourceBtn}
+          onPress={handleExcludeSource}
+        >
+          <Ionicons name="eye-off-outline" size={14} color={colors.textMuted} />
+          <Text style={styles.excludeSourceText}>
+            Disabilita questa sorgente
+          </Text>
+        </TouchableOpacity>
+
+        {/* Action Items Panel */}
+        {showActions && (
+          <View style={styles.actionsPanel}>
+            <Text style={styles.actionsPanelTitle}>Cosa Fare</Text>
+            {loadingActions ? (
+              <ActivityIndicator size="small" color={colors.primary} />
+            ) : (
+              actionItems.map((item, i) => (
+                <View key={i} style={[styles.actionItem, {
+                  borderLeftColor: item.priority === 'critical' ? colors.critical
+                    : item.priority === 'high' ? colors.error
+                    : item.priority === 'medium' ? colors.warning
+                    : colors.textMuted,
+                }]}>
+                  <Ionicons
+                    name={item.icon || 'checkmark-circle'}
+                    size={16}
+                    color={item.priority === 'critical' ? colors.critical
+                      : item.priority === 'high' ? colors.error
+                      : item.priority === 'medium' ? colors.warning
+                      : colors.success}
+                  />
+                  <Text style={styles.actionItemText}>{item.action}</Text>
+                </View>
+              ))
+            )}
+          </View>
+        )}
 
         {/* Export Menu */}
         {showExportMenu && hasAnalysis && (
@@ -345,6 +475,14 @@ export default function ArticleDetailScreen({ route }) {
       {/* Contenuto originale se non analizzato */}
       {!hasAnalysis && (
         <View style={styles.section}>
+          {isCurrentlyAnalyzing && (
+            <View style={styles.autoAnalyzeBar}>
+              <ActivityIndicator size="small" color={colors.primary} />
+              <Text style={styles.autoAnalyzeText}>
+                Analisi AI in corso... Il riassunto apparirà automaticamente.
+              </Text>
+            </View>
+          )}
           <Text style={styles.sectionTitle}>Contenuto</Text>
           <Text style={styles.contentText}>
             {article.content || article.summary || 'Nessun contenuto disponibile'}
@@ -358,8 +496,64 @@ export default function ArticleDetailScreen({ route }) {
 // ── Tab Components ────────────────────────────────────────────────────────────
 
 function SummaryTab({ analysis, article }) {
+  // Counts for overview
+  const iocCount = analysis.indicators?.length || 0;
+  const cveCount = analysis.vulnerabilities?.length || 0;
+  const techniqueCount = analysis.attack_techniques?.length || 0;
+  const actorCount = analysis.threat_actors?.length || 0;
+  const malwareCount = analysis.malware_families?.length || 0;
+
   return (
     <View>
+      {/* Overview Card - key highlights at a glance */}
+      <View style={styles.overviewCard}>
+        <Text style={styles.overviewTitle}>Panoramica Articolo</Text>
+        <View style={styles.overviewGrid}>
+          {iocCount > 0 && (
+            <View style={styles.overviewItem}>
+              <Ionicons name="bug-outline" size={16} color={colors.warning} />
+              <Text style={styles.overviewValue}>{iocCount}</Text>
+              <Text style={styles.overviewLabel}>IoC</Text>
+            </View>
+          )}
+          {cveCount > 0 && (
+            <View style={styles.overviewItem}>
+              <Ionicons name="alert-circle-outline" size={16} color={colors.error} />
+              <Text style={styles.overviewValue}>{cveCount}</Text>
+              <Text style={styles.overviewLabel}>CVE</Text>
+            </View>
+          )}
+          {techniqueCount > 0 && (
+            <View style={styles.overviewItem}>
+              <Ionicons name="git-network-outline" size={16} color={colors.primary} />
+              <Text style={styles.overviewValue}>{techniqueCount}</Text>
+              <Text style={styles.overviewLabel}>MITRE</Text>
+            </View>
+          )}
+          {actorCount > 0 && (
+            <View style={styles.overviewItem}>
+              <Ionicons name="skull-outline" size={16} color={colors.critical} />
+              <Text style={styles.overviewValue}>{actorCount}</Text>
+              <Text style={styles.overviewLabel}>Actor</Text>
+            </View>
+          )}
+          {malwareCount > 0 && (
+            <View style={styles.overviewItem}>
+              <Ionicons name="warning-outline" size={16} color={colors.high} />
+              <Text style={styles.overviewValue}>{malwareCount}</Text>
+              <Text style={styles.overviewLabel}>Malware</Text>
+            </View>
+          )}
+          {analysis.confidence_score > 0 && (
+            <View style={styles.overviewItem}>
+              <Ionicons name="analytics-outline" size={16} color={colors.success} />
+              <Text style={styles.overviewValue}>{Math.round(analysis.confidence_score * 100)}%</Text>
+              <Text style={styles.overviewLabel}>Confidenza</Text>
+            </View>
+          )}
+        </View>
+      </View>
+
       {/* Riassunto Italiano */}
       {analysis.summary_it ? (
         <View style={styles.section}>
@@ -741,6 +935,46 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
+  // Exclude Source
+  excludeSourceBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    marginTop: spacing.sm,
+    paddingVertical: spacing.xs,
+  },
+  excludeSourceText: {
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+  },
+  // Action Items Panel
+  actionsPanel: {
+    marginTop: spacing.md,
+    backgroundColor: colors.surfaceLight,
+    borderRadius: borderRadius.md,
+    padding: spacing.lg,
+  },
+  actionsPanelTitle: {
+    fontSize: fontSize.lg,
+    fontWeight: '600',
+    color: colors.text,
+    marginBottom: spacing.md,
+  },
+  actionItem: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.sm,
+    marginBottom: spacing.md,
+    paddingLeft: spacing.sm,
+    borderLeftWidth: 3,
+    paddingVertical: spacing.xs,
+  },
+  actionItemText: {
+    flex: 1,
+    fontSize: fontSize.md,
+    color: colors.text,
+    lineHeight: 22,
+  },
   // Tabs
   tabRow: {
     flexDirection: 'row',
@@ -1041,5 +1275,54 @@ const styles = StyleSheet.create({
   exportMenuItemText: {
     fontSize: fontSize.md,
     color: colors.text,
+  },
+  // Overview Card
+  overviewCard: {
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.lg,
+    padding: spacing.lg,
+    marginBottom: spacing.xl,
+    borderWidth: 1,
+    borderColor: colors.primary + '30',
+  },
+  overviewTitle: {
+    fontSize: fontSize.md,
+    fontWeight: '600',
+    color: colors.primary,
+    marginBottom: spacing.md,
+  },
+  overviewGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing.md,
+  },
+  overviewItem: {
+    alignItems: 'center',
+    minWidth: 60,
+    gap: spacing.xs,
+  },
+  overviewValue: {
+    fontSize: fontSize.xl,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  overviewLabel: {
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+  },
+  // Auto-analyze banner
+  autoAnalyzeBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.primary + '15',
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  autoAnalyzeText: {
+    flex: 1,
+    fontSize: fontSize.sm,
+    color: colors.primary,
   },
 });

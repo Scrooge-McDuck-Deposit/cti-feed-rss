@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Response
@@ -31,6 +31,11 @@ from app.models.schemas import (
     STIXBundleResponse,
     TechnicalReport,
     ThreatCategory,
+    SearchQuery,
+    SearchResult,
+    SearchResponse,
+    MonitoredAsset,
+    AssetAlert,
 )
 from app.services.ai_service import ai_service
 from app.services.categorizer import categorizer_service
@@ -44,6 +49,7 @@ from app.services.taxii_service import taxii_service, TAXII_MEDIA_TYPE, COLLECTI
 from app.services.thehive_service import thehive_service
 from app.services.qradar_service import qradar_service
 from app.services.elastic_service import elastic_service
+from app.services.watchlist_service import watchlist_service
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +58,31 @@ router = APIRouter()
 # ── Background Task Registry ──────────────────────────────────────────────────
 
 _task_registry: dict[str, dict] = {}
+
+# ── Favorites & Excluded Sources (in-memory + file persistence) ───────────────
+
+_favorites_file = settings.CACHE_DIR / "favorites.json"
+_excluded_sources_file = settings.CACHE_DIR / "excluded_sources.json"
+
+
+def _load_json_set(path) -> set[str]:
+    try:
+        if path.exists():
+            return set(json.loads(path.read_text(encoding="utf-8")))
+    except (json.JSONDecodeError, OSError):
+        pass
+    return set()
+
+
+def _save_json_set(path, data: set[str]):
+    path.write_text(json.dumps(sorted(data)), encoding="utf-8")
+
+
+_favorites: set[str] = _load_json_set(_favorites_file)
+_excluded_sources: set[str] = _load_json_set(_excluded_sources_file)
+
+# Maximum article age: 6 months
+_MAX_ARTICLE_AGE = timedelta(days=180)
 
 
 async def _run_fetch_task(task_id: str, feed_id: Optional[str] = None):
@@ -180,6 +211,14 @@ async def list_articles(
         status=status,
         search=search,
     )
+
+    # Exclude disabled sources and articles older than 6 months
+    cutoff_date = datetime.utcnow() - _MAX_ARTICLE_AGE
+    all_articles = [
+        a for a in all_articles
+        if a.feed_id not in _excluded_sources
+        and not ((a.published or a.fetched_at) and (a.published or a.fetched_at) < cutoff_date)
+    ]
 
     # Ordina per data (più recenti prima)
     all_articles.sort(
@@ -617,6 +656,624 @@ async def preview_elasticsearch(article_id: str):
     return elastic_service.build_ecs_document(article)
 
 
+# ── Search Endpoints ───────────────────────────────────────────────────────────
+
+
+@router.post("/search", response_model=SearchResponse)
+async def search_articles(body: SearchQuery):
+    """Ricerca articoli con filtri multipli e scoring AI.
+
+    Non carica tutto: fetcha e filtra on-demand.
+    """
+    import asyncio
+
+    # Step 1: Se non ci sono articoli in cache, fetcha prima
+    all_articles = cache_manager.get_all_cached_articles()
+
+    if not all_articles:
+        # Fetch veloce dei feed per avere articoli
+        articles_raw = await rss_service.fetch_all_feeds()
+        for article in articles_raw:
+            existing = cache_manager.get_article(article.id)
+            if not existing:
+                feed = get_feed_by_id(article.feed_id)
+                analyzed = ArticleAnalyzed(
+                    **article.model_dump(),
+                    feed_name=feed.name if feed else "",
+                )
+                cache_manager.save_article(analyzed)
+        all_articles = cache_manager.get_all_cached_articles()
+
+    # Step 2: Filtra articoli
+    filtered = _apply_search_filters(all_articles, body)
+
+    # Step 3: Ordina per ricchezza di contenuto e data
+    def _content_richness(art: ArticleAnalyzed) -> float:
+        """Score 0-1 based on content completeness."""
+        score = 0.0
+        if art.content and len(art.content) > 200:
+            score += 0.3
+        if art.content and len(art.content) > 1000:
+            score += 0.1
+        if art.summary and len(art.summary) > 100:
+            score += 0.1
+        if art.analysis:
+            if art.analysis.summary_it:
+                score += 0.1
+            if art.analysis.indicators:
+                score += 0.1
+            if art.analysis.key_findings:
+                score += 0.1
+            if art.analysis.threat_actors:
+                score += 0.1
+            if art.analysis.attack_techniques:
+                score += 0.1
+        return score
+
+    filtered.sort(
+        key=lambda a: (_content_richness(a), a.published or a.fetched_at),
+        reverse=True,
+    )
+
+    # Step 4: AI scoring (su Max 50 articoli per performance)
+    results: list[SearchResult] = []
+    score_candidates = filtered[:50]
+
+    if body.ai_score and body.query and ai_service.is_available:
+        # Score in batch parallelo (max 10 concurrent)
+        sem = asyncio.Semaphore(10)
+
+        async def score_one(art: ArticleAnalyzed):
+            async with sem:
+                s = await ai_service.score_relevance(
+                    art.title,
+                    art.summary or (art.analysis.summary_it if art.analysis else ""),
+                    body.query,
+                    body.categories or None,
+                )
+                return SearchResult(
+                    article=art,
+                    relevance_score=s["score"],
+                    match_reasons=[s["reason"]] if s["reason"] else [],
+                    ai_suggestion=s.get("suggestion", ""),
+                )
+
+        scored = await asyncio.gather(*[score_one(a) for a in score_candidates])
+        results = sorted(scored, key=lambda r: r.relevance_score, reverse=True)
+    else:
+        # Scoring base senza AI
+        for art in score_candidates:
+            score_data = ai_service._basic_score(
+                art.title,
+                art.summary or "",
+                body.query or "",
+                body.categories or None,
+            )
+            # Boost score by content richness
+            richness = _content_richness(art)
+            base_score = score_data["score"]
+            final_score = min(1.0, base_score * 0.6 + richness * 0.4) if not body.query else base_score
+            results.append(SearchResult(
+                article=art,
+                relevance_score=final_score,
+                match_reasons=[score_data["reason"]] if score_data["reason"] else [],
+            ))
+        results.sort(key=lambda r: r.relevance_score, reverse=True)
+
+    # Paginazione
+    total = len(results)
+    start = (body.page - 1) * body.page_size
+    end = start + body.page_size
+    page_results = results[start:end]
+
+    # AI suggestions (solo alla prima pagina)
+    ai_suggestions = []
+    if body.page == 1 and body.query and ai_service.is_available:
+        ai_suggestions = await ai_service.generate_search_suggestions(body.query, total)
+
+    query_parts = []
+    if body.query:
+        query_parts.append(f'"{body.query}"')
+    if body.categories:
+        query_parts.append(f"categorie: {', '.join(body.categories)}")
+    if body.severities:
+        query_parts.append(f"severità: {', '.join(body.severities)}")
+
+    return SearchResponse(
+        results=page_results,
+        total=total,
+        page=body.page,
+        page_size=body.page_size,
+        has_next=end < total,
+        query_summary=" | ".join(query_parts) if query_parts else "Tutti gli articoli",
+        ai_suggestions=ai_suggestions,
+    )
+
+
+def _apply_search_filters(
+    articles: list[ArticleAnalyzed],
+    query: SearchQuery,
+) -> list[ArticleAnalyzed]:
+    """Applica i filtri della ricerca agli articoli."""
+    filtered = []
+    search_lower = query.query.lower().strip() if query.query else ""
+    cutoff_date = datetime.utcnow() - _MAX_ARTICLE_AGE
+
+    for art in articles:
+        # Exclude articles from disabled sources
+        if art.feed_id in _excluded_sources:
+            continue
+
+        # Exclude articles older than 6 months
+        art_date = art.published or art.fetched_at
+        if art_date and art_date < cutoff_date:
+            continue
+        # Categoria — skip filter for unanalyzed articles
+        if query.categories and art.analysis:
+            art_cat = art.analysis.threat_category.value
+            if art_cat not in query.categories:
+                continue
+
+        # Severità — skip filter for unanalyzed articles
+        if query.severities and art.analysis:
+            art_sev = art.analysis.severity.value
+            if art_sev not in query.severities:
+                continue
+
+        # Feed
+        if query.feed_ids and art.feed_id not in query.feed_ids:
+            continue
+
+        # Date range
+        art_date = art.published or art.fetched_at
+        if query.date_from and art_date and art_date < query.date_from:
+            continue
+        if query.date_to and art_date and art_date > query.date_to:
+            continue
+
+        # IoC type filter
+        if query.ioc_types and art.analysis:
+            has_matching_ioc = any(
+                ioc.type in query.ioc_types
+                for ioc in art.analysis.indicators
+            )
+            if not has_matching_ioc:
+                continue
+
+        # Full-text search
+        if search_lower:
+            text = f"{art.title} {art.summary} {art.content or ''}".lower()
+            # Anche IoC
+            if art.analysis:
+                ioc_text = " ".join(i.value for i in art.analysis.indicators)
+                cve_text = " ".join(v.cve_id for v in art.analysis.vulnerabilities)
+                text += f" {ioc_text} {cve_text}".lower()
+            if search_lower not in text:
+                # Prova match multi-termine (AND)
+                terms = search_lower.split()
+                if not all(t in text for t in terms):
+                    continue
+
+        filtered.append(art)
+
+    return filtered
+
+
+# ── Watchlist / Monitored Assets ───────────────────────────────────────────────
+
+
+@router.get("/watchlist")
+async def get_watchlist():
+    """Restituisce tutti gli asset monitorati."""
+    return [a.model_dump(mode="json") for a in watchlist_service.get_all()]
+
+
+@router.post("/watchlist")
+async def add_watchlist_asset(body: dict):
+    """Aggiunge un asset alla watchlist.
+
+    Body: { "asset_type": "ip|domain|hash|cve|keyword|email", "value": "...", "label": "..." }
+    """
+    asset_type = body.get("asset_type", "").strip()
+    value = body.get("value", "").strip()
+    if not asset_type or not value:
+        raise HTTPException(status_code=400, detail="asset_type e value sono obbligatori")
+    if asset_type not in ("ip", "domain", "hash", "cve", "keyword", "email", "url"):
+        raise HTTPException(status_code=400, detail="Tipo non valido. Usa: ip, domain, hash, cve, keyword, email, url")
+
+    asset = watchlist_service.add_asset(asset_type, value, body.get("label", ""))
+    return asset.model_dump(mode="json")
+
+
+@router.delete("/watchlist/{asset_id}")
+async def remove_watchlist_asset(asset_id: str):
+    """Rimuove un asset dalla watchlist."""
+    if not watchlist_service.remove_asset(asset_id):
+        raise HTTPException(status_code=404, detail="Asset non trovato")
+    return {"message": "Asset rimosso"}
+
+
+@router.patch("/watchlist/{asset_id}/toggle")
+async def toggle_watchlist_asset(asset_id: str):
+    """Abilita/disabilita un asset monitorato."""
+    asset = watchlist_service.toggle_asset(asset_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset non trovato")
+    return asset.model_dump(mode="json")
+
+
+@router.get("/watchlist/alerts")
+async def get_watchlist_alerts():
+    """Scansiona tutti gli articoli in cache e restituisce gli alert per gli asset monitorati."""
+    all_articles = cache_manager.get_all_cached_articles()
+    alerts = watchlist_service.scan_all_articles(all_articles)
+
+    # Ordina per relevance score
+    alerts.sort(key=lambda a: a.relevance_score, reverse=True)
+
+    return {
+        "total_alerts": len(alerts),
+        "assets_monitored": len(watchlist_service.get_enabled()),
+        "alerts": [
+            {
+                "asset_type": a.asset.asset_type,
+                "asset_value": a.asset.value,
+                "asset_label": a.asset.label,
+                "article_id": a.article.id,
+                "article_title": a.article.title,
+                "matched_in": a.matched_in,
+                "relevance_score": a.relevance_score,
+                "article_date": (a.article.published or a.article.fetched_at).isoformat() if (a.article.published or a.article.fetched_at) else None,
+            }
+            for a in alerts[:100]  # Max 100
+        ],
+    }
+
+
+# ── Progressive Batch Analysis ─────────────────────────────────────────────────
+
+
+async def _run_batch_analysis_task(task_id: str, article_ids: list[str], batch_size: int = 5):
+    """Analyze articles in batches, updating task progress per-article."""
+    import time as _time
+
+    task = _task_registry[task_id]
+    task["status"] = "running"
+    task["analyzed"] = []
+    task["errors"] = []
+    task["total"] = len(article_ids)
+    task["started_at"] = _time.time()
+    task["current_article"] = None
+    task["speed"] = 0
+    task["eta_seconds"] = None
+
+    def _update_progress():
+        done = len(task["analyzed"]) + len(task["errors"])
+        task["progress"] = done
+        elapsed = _time.time() - task["started_at"]
+        if done > 0 and elapsed > 0:
+            task["speed"] = round(done / elapsed, 2)
+            remaining = task["total"] - done
+            task["eta_seconds"] = round(remaining / task["speed"])
+        else:
+            task["eta_seconds"] = None
+
+    for i in range(0, len(article_ids), batch_size):
+        batch = article_ids[i:i + batch_size]
+        for aid in batch:
+            try:
+                article = cache_manager.get_article(aid)
+                if not article:
+                    _update_progress()
+                    continue
+                if article.status == ArticleStatus.ANALYZED and article.analysis:
+                    task["analyzed"].append(aid)
+                    _update_progress()
+                    continue
+
+                task["current_article"] = article.title[:80] if article.title else aid
+
+                from app.models.schemas import Article as RawArticle
+                raw = RawArticle(
+                    id=article.id, feed_id=article.feed_id, title=article.title,
+                    link=article.link, published=article.published, summary=article.summary,
+                    content=article.content, author=article.author, tags=article.tags,
+                )
+                analysis = await ai_service.analyze_article(raw)
+                article.analysis = analysis
+                article.status = ArticleStatus.ANALYZED
+                stix_bundle = stix_service.generate_bundle(article)
+                if isinstance(stix_bundle, str):
+                    stix_bundle = json.loads(stix_bundle)
+                article.stix_bundle = stix_bundle
+                cache_manager.save_article(article)
+                task["analyzed"].append(aid)
+            except Exception as e:
+                logger.error("Batch analysis error for %s: %s", aid, e)
+                task["errors"].append(aid)
+
+            _update_progress()
+
+    task["status"] = "completed"
+    task["current_article"] = None
+    task["completed_at"] = datetime.utcnow().isoformat()
+
+
+@router.post("/articles/analyze-batch")
+async def analyze_batch(background_tasks: BackgroundTasks, body: dict = None):
+    """Avvia analisi progressiva: analizza articoli in batch di 5.
+
+    Body opzionale: { "article_ids": [...], "batch_size": 5 }
+    Se article_ids non è specificato, analizza tutti i pending.
+    """
+    body = body or {}
+    article_ids = body.get("article_ids")
+    batch_size = min(body.get("batch_size", 5), 10)
+
+    if not article_ids:
+        all_articles = cache_manager.get_all_cached_articles()
+        cutoff = datetime.utcnow() - _MAX_ARTICLE_AGE
+        article_ids = [
+            a.id for a in all_articles
+            if a.status == ArticleStatus.PENDING
+            and a.feed_id not in _excluded_sources
+            and not ((a.published or a.fetched_at) and (a.published or a.fetched_at) < cutoff)
+        ]
+
+    task_id = uuid.uuid4().hex[:12]
+    _task_registry[task_id] = {
+        "task_id": task_id,
+        "status": "pending",
+        "type": "batch_analysis",
+        "total": len(article_ids),
+        "progress": 0,
+        "analyzed": [],
+        "errors": [],
+        "created_at": datetime.utcnow().isoformat(),
+        "started_at": None,
+        "current_article": None,
+        "speed": 0,
+        "eta_seconds": None,
+    }
+    background_tasks.add_task(_run_batch_analysis_task, task_id, article_ids, batch_size)
+    return _task_registry[task_id]
+
+
+# ── Favorites ──────────────────────────────────────────────────────────────────
+
+
+@router.get("/favorites")
+async def get_favorites():
+    """Restituisce gli ID degli articoli preferiti e i loro dati."""
+    articles = []
+    for aid in sorted(_favorites):
+        art = cache_manager.get_article(aid)
+        if art:
+            articles.append(art)
+    return {"favorite_ids": sorted(_favorites), "articles": articles}
+
+
+@router.post("/favorites/{article_id}")
+async def add_favorite(article_id: str):
+    """Aggiunge un articolo ai preferiti."""
+    if not cache_manager.get_article(article_id):
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    _favorites.add(article_id)
+    _save_json_set(_favorites_file, _favorites)
+    return {"message": "Aggiunto ai preferiti", "article_id": article_id}
+
+
+@router.delete("/favorites/{article_id}")
+async def remove_favorite(article_id: str):
+    """Rimuove un articolo dai preferiti."""
+    _favorites.discard(article_id)
+    _save_json_set(_favorites_file, _favorites)
+    return {"message": "Rimosso dai preferiti", "article_id": article_id}
+
+
+@router.get("/favorites/check/{article_id}")
+async def check_favorite(article_id: str):
+    """Controlla se un articolo è nei preferiti."""
+    return {"is_favorite": article_id in _favorites}
+
+
+# ── Excluded Sources ───────────────────────────────────────────────────────────
+
+
+@router.get("/sources/excluded")
+async def get_excluded_sources():
+    """Restituisce le sorgenti disabilitate con info feed."""
+    sources_info = []
+    for fid in sorted(_excluded_sources):
+        feed = get_feed_by_id(fid)
+        sources_info.append({
+            "feed_id": fid,
+            "name": feed.name if feed else fid,
+            "url": feed.url if feed else "",
+            "language": feed.language if feed else "",
+        })
+    return {"excluded": sources_info}
+
+
+@router.post("/sources/exclude/{feed_id}")
+async def exclude_source(feed_id: str):
+    """Disabilita una sorgente feed."""
+    _excluded_sources.add(feed_id)
+    _save_json_set(_excluded_sources_file, _excluded_sources)
+    return {"message": "Sorgente disabilitata", "feed_id": feed_id}
+
+
+@router.delete("/sources/exclude/{feed_id}")
+async def reenable_source(feed_id: str):
+    """Riabilita una sorgente feed precedentemente disabilitata."""
+    _excluded_sources.discard(feed_id)
+    _save_json_set(_excluded_sources_file, _excluded_sources)
+    return {"message": "Sorgente riabilitata", "feed_id": feed_id}
+
+
+# ── Action Items ───────────────────────────────────────────────────────────────
+
+
+@router.get("/articles/{article_id}/actions")
+async def get_article_actions(article_id: str):
+    """Restituisce le azioni consigliate per un articolo analizzato."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+
+    actions = []
+
+    if not article.analysis:
+        return {"article_id": article_id, "actions": [
+            {"priority": "high", "icon": "sparkles", "action": "Analizza questo articolo con AI per ottenere raccomandazioni dettagliate."}
+        ]}
+
+    analysis = article.analysis
+
+    # From recommendations
+    for i, rec in enumerate(analysis.recommendations or []):
+        actions.append({
+            "priority": "medium",
+            "icon": "checkmark-circle",
+            "action": rec,
+        })
+
+    # From IoCs
+    if analysis.indicators:
+        ioc_types = set(i.type for i in analysis.indicators)
+        ioc_vals = [i.value for i in analysis.indicators[:5]]
+        actions.insert(0, {
+            "priority": "high",
+            "icon": "shield-checkmark",
+            "action": f"Blocca/monitora {len(analysis.indicators)} IoC trovati ({', '.join(ioc_types)}): {', '.join(ioc_vals)}",
+        })
+
+    # From CVEs
+    for vuln in (analysis.vulnerabilities or [])[:3]:
+        score_text = f" (CVSS {vuln.cvss_score})" if vuln.cvss_score else ""
+        actions.append({
+            "priority": "critical" if vuln.cvss_score and vuln.cvss_score >= 9 else "high",
+            "icon": "alert-circle",
+            "action": f"Applica patch per {vuln.cve_id}{score_text}: {vuln.description or 'Vedi NVD per dettagli'}",
+        })
+
+    # From MITRE techniques
+    if analysis.attack_techniques:
+        technique_names = [t.technique_name for t in analysis.attack_techniques[:3]]
+        actions.append({
+            "priority": "medium",
+            "icon": "git-network",
+            "action": f"Verifica le difese contro: {', '.join(technique_names)}",
+        })
+
+    if not actions:
+        actions.append({
+            "priority": "low",
+            "icon": "information-circle",
+            "action": "Nessuna azione urgente richiesta. Articolo informativo.",
+        })
+
+    return {"article_id": article_id, "actions": actions}
+
+
+# ── Demo / Test Article ───────────────────────────────────────────────────────
+
+
+@router.post("/demo/create-test-article")
+async def create_demo_article():
+    """Crea un articolo di esempio completo con analisi pre-compilata per demo/tutorial."""
+    demo_id = "demo_test_article_001"
+
+    existing = cache_manager.get_article(demo_id)
+    if existing:
+        return existing
+
+    demo_article = ArticleAnalyzed(
+        id=demo_id,
+        feed_id="demo_feed",
+        title="[DEMO] APT29 sfrutta vulnerabilità critica in Microsoft Exchange per campagna di spionaggio",
+        link="https://example.com/demo-article",
+        published=datetime.utcnow(),
+        summary="Gruppo APT29 (Cozy Bear) identificato in una nuova campagna di spionaggio che sfrutta CVE-2024-21400 in Microsoft Exchange Server.",
+        content=(
+            "Ricercatori di sicurezza hanno identificato una nuova campagna di spionaggio attribuita "
+            "ad APT29 (Cozy Bear), il gruppo di minacce persistenti avanzate associato ai servizi "
+            "di intelligence russi. La campagna sfrutta una vulnerabilità critica (CVE-2024-21400) "
+            "in Microsoft Exchange Server per ottenere accesso iniziale alle reti target.\n\n"
+            "Gli attaccanti utilizzano tecniche di spear-phishing con allegati malevoli che, "
+            "una volta aperti, scaricano un payload attraverso PowerShell. Il malware FoggyWeb "
+            "viene installato come backdoor persistente, consentendo l'esfiltrazione di dati sensibili.\n\n"
+            "Indicatori di compromissione:\n"
+            "- IP C2: 185.220.101.45\n"
+            "- Dominio: update-service.example-cdn.com\n"
+            "- Hash SHA256: a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456\n"
+            "- Email di phishing: security-update@legitimate-corp.com\n\n"
+            "Le organizzazioni che utilizzano Microsoft Exchange dovrebbero applicare "
+            "immediatamente le patch di sicurezza e verificare la presenza degli IoC indicati."
+        ),
+        author="CTI Research Team",
+        tags=["apt29", "exchange", "spionaggio", "russia"],
+        feed_name="Demo Feed - CTI Intelligence",
+        status=ArticleStatus.ANALYZED,
+        analysis=AIAnalysis(
+            summary_it=(
+                "APT29 (Cozy Bear) sta conducendo una campagna di spionaggio sfruttando "
+                "CVE-2024-21400 in Microsoft Exchange. Il gruppo utilizza spear-phishing "
+                "per distribuire il malware FoggyWeb come backdoor persistente, puntando "
+                "all'esfiltrazione di dati da organizzazioni governative e del settore difesa."
+            ),
+            summary_en=(
+                "APT29 (Cozy Bear) is conducting an espionage campaign exploiting "
+                "CVE-2024-21400 in Microsoft Exchange. The group uses spear-phishing "
+                "to deploy FoggyWeb malware as a persistent backdoor, targeting data "
+                "exfiltration from government and defense sector organizations."
+            ),
+            threat_category=ThreatCategory.APT,
+            severity="critical",
+            threat_actors=[{
+                "name": "APT29",
+                "aliases": ["Cozy Bear", "The Dukes", "Midnight Blizzard"],
+                "motivation": "Spionaggio statale",
+                "country": "Russia",
+            }],
+            indicators=[
+                {"type": "ip", "value": "185.220.101.45", "context": "Server C2 principale"},
+                {"type": "domain", "value": "update-service.example-cdn.com", "context": "Dominio C2 per download payload"},
+                {"type": "hash_sha256", "value": "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456", "context": "Hash del payload FoggyWeb"},
+                {"type": "email", "value": "security-update@legitimate-corp.com", "context": "Indirizzo mittente phishing"},
+            ],
+            attack_techniques=[
+                {"technique_id": "T1566.001", "technique_name": "Spear-Phishing Attachment", "tactic": "Initial Access", "description": "Email con allegati malevoli Word/Excel"},
+                {"technique_id": "T1059.001", "technique_name": "PowerShell", "tactic": "Execution", "description": "Script PowerShell per download del payload"},
+                {"technique_id": "T1505.003", "technique_name": "Web Shell", "tactic": "Persistence", "description": "Web shell installata su Exchange compromesso"},
+            ],
+            vulnerabilities=[
+                {"cve_id": "CVE-2024-21400", "cvss_score": 9.8, "description": "Remote Code Execution in Microsoft Exchange Server", "affected_products": ["Microsoft Exchange Server 2019", "Microsoft Exchange Server 2016"]},
+            ],
+            affected_sectors=["government", "defense", "energy"],
+            malware_families=["FoggyWeb", "EnvyScout"],
+            recommendations=[
+                "Applicare immediatamente la patch per CVE-2024-21400 su tutti i server Exchange",
+                "Bloccare gli IoC identificati su firewall, proxy e sistemi EDR",
+                "Verificare i log di Exchange per accessi anomali nelle ultime 4 settimane",
+                "Implementare MFA su tutte le caselle email con accesso a dati sensibili",
+                "Eseguire threat hunting cercando processi PowerShell anomali su server Exchange",
+            ],
+            key_findings=[
+                "APT29 ha evoluto le proprie TTP utilizzando exploit Exchange recenti",
+                "La campagna è attiva da almeno 3 settimane con target in Europa",
+                "FoggyWeb è stato aggiornato con capacità di evasione EDR migliorate",
+                "Il gruppo utilizza infrastruttura cloud legittima per il C2",
+            ],
+            tags=["apt29", "cozy-bear", "exchange", "cve-2024-21400", "foggyweb", "spionaggio"],
+            confidence_score=0.92,
+        ),
+    )
+
+    cache_manager.save_article(demo_article)
+    return demo_article
+
+
 # ── TAXII 2.1 Endpoints ───────────────────────────────────────────────────────
 
 
@@ -686,6 +1343,57 @@ async def taxii_manifest(collection_id: str, limit: int = Query(50, ge=1, le=500
 
 
 # ── AI Status ──────────────────────────────────────────────────────────────────
+
+
+@router.get("/versions")
+async def check_versions():
+    """Restituisce le versioni dei componenti backend e le ultime disponibili su PyPI."""
+    import importlib.metadata
+    import aiohttp
+
+    packages = [
+        "fastapi", "uvicorn", "pydantic", "aiohttp", "feedparser",
+        "beautifulsoup4", "stix2", "pyyaml",
+    ]
+
+    results = []
+
+    async def check_one(pkg_name: str):
+        # Versione installata
+        try:
+            installed = importlib.metadata.version(pkg_name)
+        except importlib.metadata.PackageNotFoundError:
+            installed = None
+
+        # Ultima versione su PyPI
+        latest = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"https://pypi.org/pypi/{pkg_name}/json",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        latest = data.get("info", {}).get("version")
+        except Exception:
+            pass
+
+        return {
+            "package": pkg_name,
+            "installed": installed,
+            "latest": latest,
+            "up_to_date": installed == latest if installed and latest else None,
+        }
+
+    results = await asyncio.gather(*[check_one(p) for p in packages])
+    all_ok = all(r["up_to_date"] for r in results if r["up_to_date"] is not None)
+
+    return {
+        "components": list(results),
+        "all_up_to_date": all_ok,
+        "python_version": __import__("sys").version,
+    }
 
 
 @router.get("/ai/status")

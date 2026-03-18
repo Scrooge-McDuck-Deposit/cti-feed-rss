@@ -18,6 +18,7 @@ import { Ionicons } from '@expo/vector-icons';
 import useStore from '../store/ArticleStore';
 import ArticleCard from '../components/ArticleCard';
 import CategoryBadge from '../components/CategoryBadge';
+import ProgressBar from '../components/ProgressBar';
 import { colors, spacing, fontSize, borderRadius } from '../theme';
 
 const SEARCH_DEBOUNCE_MS = 500;
@@ -36,6 +37,9 @@ export default function FeedScreen({ navigation, route }) {
     refreshArticles,
     setFilter,
     clearFilters,
+    batchAnalysisTask,
+    dismissBatchAnalysis,
+    refreshProgress,
   } = useStore();
 
   const [searchText, setSearchText] = useState('');
@@ -192,6 +196,34 @@ export default function FeedScreen({ navigation, route }) {
           <TouchableOpacity onPress={clearFilters}>
             <Text style={styles.clearFiltersText}>Pulisci tutto</Text>
           </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Progress bars */}
+      {batchAnalysisTask && (batchAnalysisTask.status === 'running' || batchAnalysisTask.status === 'pending' || batchAnalysisTask.status === 'completed') && (
+        <View style={{ paddingHorizontal: spacing.md }}>
+          <ProgressBar
+            progress={batchAnalysisTask.progress || 0}
+            total={batchAnalysisTask.total || 0}
+            analyzed={batchAnalysisTask.analyzed?.length || 0}
+            errors={batchAnalysisTask.errors?.length || 0}
+            status={batchAnalysisTask.status}
+            startedAt={batchAnalysisTask.created_at}
+            label="Analisi AI Batch"
+            onDismiss={batchAnalysisTask.status === 'completed' || batchAnalysisTask.status === 'error' ? dismissBatchAnalysis : null}
+            compact
+          />
+        </View>
+      )}
+      {refreshProgress && (
+        <View style={{ paddingHorizontal: spacing.md }}>
+          <ProgressBar
+            progress={refreshProgress.progress || 0}
+            total={refreshProgress.total || 0}
+            status={refreshProgress.status || 'running'}
+            label={refreshProgress.label || 'Scaricamento...'}
+            compact
+          />
         </View>
       )}
 

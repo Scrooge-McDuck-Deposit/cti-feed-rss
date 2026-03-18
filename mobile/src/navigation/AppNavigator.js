@@ -12,6 +12,7 @@ import HomeScreen from '../screens/HomeScreen';
 import FeedScreen from '../screens/FeedScreen';
 import ArticleDetailScreen from '../screens/ArticleDetailScreen';
 import ReportsScreen from '../screens/ReportsScreen';
+import WatchlistScreen from '../screens/WatchlistScreen';
 import SettingsScreen from '../screens/SettingsScreen';
 import { colors, fontSize } from '../theme';
 
@@ -85,10 +86,13 @@ function MainTabs() {
           let iconName;
           switch (route.name) {
             case 'Dashboard':
-              iconName = focused ? 'shield-checkmark' : 'shield-checkmark-outline';
+              iconName = focused ? 'search' : 'search-outline';
               break;
             case 'Feed':
               iconName = focused ? 'newspaper' : 'newspaper-outline';
+              break;
+            case 'Watchlist':
+              iconName = focused ? 'shield-checkmark' : 'shield-checkmark-outline';
               break;
             case 'Reports':
               iconName = focused ? 'document-text' : 'document-text-outline';
@@ -120,12 +124,23 @@ function MainTabs() {
       <Tab.Screen
         name="Dashboard"
         component={HomeScreen}
-        options={{ title: 'Dashboard' }}
+        options={{ title: 'Cerca' }}
       />
       <Tab.Screen
         name="Feed"
         component={FeedStack}
         options={{ title: 'Feed' }}
+      />
+      <Tab.Screen
+        name="Watchlist"
+        component={WatchlistScreen}
+        options={{
+          title: 'Watchlist',
+          headerShown: true,
+          headerStyle: screenOptions.headerStyle,
+          headerTintColor: screenOptions.headerTintColor,
+          headerTitle: '',
+        }}
       />
       <Tab.Screen
         name="Reports"
@@ -158,6 +173,12 @@ export default function AppNavigator() {
           text: colors.text,
           border: colors.border,
           notification: colors.critical,
+        },
+        fonts: {
+          regular: { fontFamily: 'System', fontWeight: '400' },
+          medium: { fontFamily: 'System', fontWeight: '500' },
+          bold: { fontFamily: 'System', fontWeight: '700' },
+          heavy: { fontFamily: 'System', fontWeight: '900' },
         },
       }}
     >

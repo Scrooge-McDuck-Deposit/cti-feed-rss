@@ -546,6 +546,107 @@ Rispondi ESCLUSIVAMENTE con il JSON."""
             confidence_score=0.3,
         )
 
+    # ── Relevance Scoring ────────────────────────────────────────────────
+
+    async def score_relevance(
+        self,
+        article_title: str,
+        article_summary: str,
+        search_query: str,
+        search_categories: list[str] | None = None,
+    ) -> dict:
+        """Calcola un relevance score AI per un articolo rispetto a una ricerca.
+
+        Returns dict con: score (0-1), reason (str), suggestion (str)
+        """
+        if not self.is_available:
+            return self._basic_score(article_title, article_summary, search_query, search_categories)
+
+        scoring_prompt = f"""Valuta la rilevanza di questo articolo rispetto alla query di ricerca.
+
+QUERY DI RICERCA: {search_query}
+{f"CATEGORIE FILTRATE: {', '.join(search_categories)}" if search_categories else ""}
+
+ARTICOLO:
+Titolo: {article_title}
+Sommario: {article_summary[:1000]}
+
+Rispondi SOLO con un JSON:
+{{
+    "score": 0.85,
+    "reason": "Breve motivazione del punteggio in italiano (1 frase)",
+    "suggestion": "Suggerimento per l'analista in italiano (1 frase, o vuoto)"
+}}
+
+Il punteggio va da 0.0 (non rilevante) a 1.0 (perfettamente pertinente).
+Rispondi ESCLUSIVAMENTE con il JSON."""
+
+        try:
+            content = await self._chat_completion(
+                system_prompt="Sei un analista CTI. Valuta la rilevanza degli articoli.",
+                user_prompt=scoring_prompt,
+                temperature=0.0,
+                max_tokens=300,
+            )
+            if content:
+                data = json.loads(content)
+                return {
+                    "score": min(1.0, max(0.0, float(data.get("score", 0.5)))),
+                    "reason": str(data.get("reason", "")),
+                    "suggestion": str(data.get("suggestion", "")),
+                }
+        except Exception as e:
+            logger.warning("AI scoring error: %s", e)
+
+        return self._basic_score(article_title, article_summary, search_query, search_categories)
+
+    def _basic_score(
+        self,
+        title: str,
+        summary: str,
+        query: str,
+        categories: list[str] | None = None,
+    ) -> dict:
+        """Scoring base senza AI — matching keyword."""
+        text = f"{title} {summary}".lower()
+        query_terms = query.lower().split()
+        if not query_terms:
+            return {"score": 0.5, "reason": "Nessuna query specificata", "suggestion": ""}
+
+        matches = sum(1 for t in query_terms if t in text)
+        score = min(1.0, matches / len(query_terms))
+
+        # Boost se match nel titolo
+        title_matches = sum(1 for t in query_terms if t in title.lower())
+        if title_matches > 0:
+            score = min(1.0, score + 0.2)
+
+        reason = f"Match {matches}/{len(query_terms)} termini" + (
+            f" ({title_matches} nel titolo)" if title_matches else ""
+        )
+        return {"score": round(score, 2), "reason": reason, "suggestion": ""}
+
+    async def generate_search_suggestions(self, query: str, results_count: int) -> list[str]:
+        """Genera suggerimenti AI basati sulla ricerca corrente."""
+        if not self.is_available or not query:
+            return []
+
+        try:
+            content = await self._chat_completion(
+                system_prompt="Sei un analista CTI. Suggerisci ricerche correlate.",
+                user_prompt=f"""L'utente ha cercato: "{query}" e ha trovato {results_count} risultati.
+Suggerisci 3-5 ricerche correlate o approfondimenti utili per un analista SOC.
+Rispondi SOLO con un JSON: {{"suggestions": ["suggerimento1", "suggerimento2", ...]}}""",
+                temperature=0.3,
+                max_tokens=300,
+            )
+            if content:
+                data = json.loads(content)
+                return data.get("suggestions", [])[:5]
+        except Exception:
+            pass
+        return []
+
 
 # Singleton
 ai_service = AIService()

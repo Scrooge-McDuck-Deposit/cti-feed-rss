@@ -218,6 +218,70 @@ class ReportRequest(BaseModel):
     language: str = "it"
 
 
+# ── Search Models ──────────────────────────────────────────────────────────────
+
+
+class SearchQuery(BaseModel):
+    """Richiesta di ricerca articoli."""
+
+    query: str = ""  # testo libero / keyword / IoC
+    categories: list[str] = Field(default_factory=list)  # categorie selezionate
+    severities: list[str] = Field(default_factory=list)
+    feed_ids: list[str] = Field(default_factory=list)
+    ioc_types: list[str] = Field(default_factory=list)  # ip, hash, domain, cve, url
+    date_from: Optional[datetime] = None
+    date_to: Optional[datetime] = None
+    ai_score: bool = True  # calcola relevance score AI
+    page: int = 1
+    page_size: int = 20
+
+
+class SearchResult(BaseModel):
+    """Singolo risultato di ricerca con score AI."""
+
+    article: ArticleAnalyzed
+    relevance_score: float = 0.0  # 0-1, calcolato dall'AI
+    match_reasons: list[str] = Field(default_factory=list)
+    ai_suggestion: str = ""  # suggerimento AI sul perché è rilevante
+
+
+class SearchResponse(BaseModel):
+    """Risposta paginata di ricerca."""
+
+    results: list[SearchResult] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+    has_next: bool = False
+    query_summary: str = ""
+    ai_suggestions: list[str] = Field(default_factory=list)
+
+
+# ── Monitored Assets Models ───────────────────────────────────────────────────
+
+
+class MonitoredAsset(BaseModel):
+    """Asset monitorato dall'utente."""
+
+    id: str = ""
+    asset_type: str  # ip, domain, hash, cve, keyword, email
+    value: str
+    label: str = ""  # nome descrittivo opzionale
+    enabled: bool = True
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_match_at: Optional[datetime] = None
+    match_count: int = 0
+
+
+class AssetAlert(BaseModel):
+    """Alert generato dal monitoraggio di un asset."""
+
+    asset: MonitoredAsset
+    article: ArticleAnalyzed
+    matched_in: str = ""  # dove è stato trovato: title, content, ioc, etc.
+    relevance_score: float = 0.0
+
+
 # ── Stats Models ───────────────────────────────────────────────────────────────
 
 

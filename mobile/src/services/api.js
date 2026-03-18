@@ -150,6 +150,12 @@ class ApiService {
     return this._fetch('/ai/test', { method: 'POST' });
   }
 
+  // ── Version Check ─────────────────────────────────────────────────
+
+  async checkVersions() {
+    return this._fetch('/versions');
+  }
+
   // ── OPML Import ────────────────────────────────────────────────────
 
   async importOpml(opmlUrl) {
@@ -188,6 +194,93 @@ class ApiService {
 
   async exportToElasticsearch(articleId) {
     return this._fetch(`/articles/${articleId}/export/elasticsearch`, { method: 'POST' });
+  }
+
+  // ── Search ────────────────────────────────────────────────────────
+
+  async searchArticles(searchQuery) {
+    return this._fetch('/search', {
+      method: 'POST',
+      body: JSON.stringify(searchQuery),
+    });
+  }
+
+  // ── Favorites ─────────────────────────────────────────────────────
+
+  async getFavorites() {
+    return this._fetch('/favorites');
+  }
+
+  async addFavorite(articleId) {
+    return this._fetch(`/favorites/${articleId}`, { method: 'POST' });
+  }
+
+  async removeFavorite(articleId) {
+    return this._fetch(`/favorites/${articleId}`, { method: 'DELETE' });
+  }
+
+  async checkFavorite(articleId) {
+    return this._fetch(`/favorites/check/${articleId}`);
+  }
+
+  // ── Excluded Sources ──────────────────────────────────────────────
+
+  async getExcludedSources() {
+    return this._fetch('/sources/excluded');
+  }
+
+  async excludeSource(feedId) {
+    return this._fetch(`/sources/exclude/${feedId}`, { method: 'POST' });
+  }
+
+  async reenableSource(feedId) {
+    return this._fetch(`/sources/exclude/${feedId}`, { method: 'DELETE' });
+  }
+
+  // ── Action Items ──────────────────────────────────────────────────
+
+  async getArticleActions(articleId) {
+    return this._fetch(`/articles/${articleId}/actions`);
+  }
+
+  // ── Batch Analysis ────────────────────────────────────────────────
+
+  async analyzeBatch(articleIds = null, batchSize = 5) {
+    return this._fetch('/articles/analyze-batch', {
+      method: 'POST',
+      body: JSON.stringify({ article_ids: articleIds, batch_size: batchSize }),
+    });
+  }
+
+  // ── Demo ──────────────────────────────────────────────────────────
+
+  async createDemoArticle() {
+    return this._fetch('/demo/create-test-article', { method: 'POST' });
+  }
+
+  // ── Watchlist ─────────────────────────────────────────────────────
+
+  async getWatchlist() {
+    return this._fetch('/watchlist');
+  }
+
+  async addWatchlistAsset(assetType, value, label = '') {
+    return this._fetch('/watchlist', {
+      method: 'POST',
+      body: JSON.stringify({ asset_type: assetType, value, label }),
+    });
+  }
+
+  async removeWatchlistAsset(assetId) {
+    return this._fetch(`/watchlist/${assetId}`, { method: 'DELETE' });
+  }
+
+  async toggleWatchlistAsset(assetId) {
+    return this._fetch(`/watchlist/${assetId}/toggle`, { method: 'PATCH' });
+  }
+
+  async getWatchlistAlerts() {
+    return this._fetch('/watchlist/alerts');
   }
 }
 

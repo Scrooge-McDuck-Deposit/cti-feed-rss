@@ -171,9 +171,11 @@ class CacheManager:
                 continue
             if status and meta.get("status") != status:
                 continue
-            if severity and meta.get("severity") != severity:
+            # Skip category/severity filter for unanalyzed articles
+            # (they have None metadata and should not be excluded)
+            if severity and meta.get("severity") is not None and meta.get("severity") != severity:
                 continue
-            if category and meta.get("category") != category:
+            if category and meta.get("category") is not None and meta.get("category") != category:
                 continue
             candidate_ids.append(article_id)
 

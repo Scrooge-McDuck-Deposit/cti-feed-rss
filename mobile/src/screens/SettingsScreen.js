@@ -16,14 +16,18 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import useStore from '../store/ArticleStore';
+import apiService from '../services/api';
 import cacheService from '../services/cacheService';
 import { colors, spacing, fontSize, borderRadius } from '../theme';
 import { formatBytes } from '../utils/helpers';
+import ProgressBar from '../components/ProgressBar';
 
 export default function SettingsScreen() {
   const {
     settings, updateSettings, feeds, aiStatus, aiConfig,
     loadAiStatus, loadAiConfig, updateAiConfig, testAiConnection, importOpml,
+    excludedSources, loadExcludedSources, reenableSource,
+    createDemoArticle, startBatchAnalysis, batchAnalysisTask, dismissBatchAnalysis,
   } = useStore();
   const [apiUrl, setApiUrl] = useState(settings.apiUrl);
   const [cacheInfo, setCacheInfo] = useState(null);
@@ -40,6 +44,10 @@ export default function SettingsScreen() {
   const [openaiModel, setOpenaiModel] = useState('gpt-4o');
   const [savingAi, setSavingAi] = useState(false);
   const [testingAi, setTestingAi] = useState(false);
+  const [checkingVersions, setCheckingVersions] = useState(false);
+  const [versionResults, setVersionResults] = useState(null);
+  const [creatingDemo, setCreatingDemo] = useState(false);
+  const [startingBatch, setStartingBatch] = useState(false);
 
   useEffect(() => {
     loadCacheInfo();
@@ -151,6 +159,70 @@ export default function SettingsScreen() {
     } finally {
       setTestingAi(false);
     }
+  }, []);
+
+  const handleCheckVersions = useCallback(async () => {
+    setCheckingVersions(true);
+    setVersionResults(null);
+    try {
+      const result = await apiService.checkVersions();
+      setVersionResults(result);
+    } catch (error) {
+      Alert.alert('Errore', error.message || 'Impossibile verificare le versioni');
+    } finally {
+      setCheckingVersions(false);
+    }
+  }, []);
+
+  const handleCreateDemo = useCallback(async () => {
+    setCreatingDemo(true);
+    try {
+      const article = await createDemoArticle();
+      Alert.alert(
+        'Articolo Demo Creato',
+        `"${article.title}" è stato creato con analisi completa. Cercalo nella lista articoli per esplorare tutte le funzionalità dell'app.`
+      );
+    } catch (error) {
+      Alert.alert('Errore', error.message || 'Impossibile creare l\'articolo demo');
+    } finally {
+      setCreatingDemo(false);
+    }
+  }, []);
+
+  const handleBatchAnalysis = useCallback(async () => {
+    setStartingBatch(true);
+    try {
+      const result = await startBatchAnalysis(null, 5);
+      Alert.alert(
+        'Analisi Avviata',
+        `Analisi batch avviata per ${result.total} articoli. Il progresso è visibile nella dashboard.`
+      );
+    } catch (error) {
+      Alert.alert('Errore', error.message || 'Impossibile avviare l\'analisi batch');
+    } finally {
+      setStartingBatch(false);
+    }
+  }, []);
+
+  const handleReenableSource = useCallback(async (feedId, feedName) => {
+    Alert.alert(
+      'Riabilita Sorgente',
+      `Vuoi riabilitare "${feedName}"?`,
+      [
+        { text: 'Annulla', style: 'cancel' },
+        {
+          text: 'Riabilita',
+          onPress: async () => {
+            try {
+              await reenableSource(feedId);
+              Alert.alert('Fatto', 'Sorgente riabilitata');
+            } catch (error) {
+              Alert.alert('Errore', error.message || 'Impossibile riabilitare');
+            }
+          },
+        },
+      ]
+    );
   }, []);
 
   return (
@@ -471,9 +543,149 @@ export default function SettingsScreen() {
         </View>
       </View>
 
+      {/* Excluded Sources */}
+      {excludedSources.length > 0 && (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Sorgenti Disabilitate</Text>
+          <Text style={styles.hint}>
+            Queste sorgenti sono state disabilitate e i loro articoli non vengono mostrati.
+          </Text>
+          {excludedSources.map((src) => (
+            <View key={src.feed_id} style={styles.excludedSourceRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.excludedSourceName}>{src.name}</Text>
+                {src.language ? (
+                  <Text style={styles.excludedSourceLang}>
+                    {src.language === 'it' ? '🇮🇹' : '🌍'} {src.language.toUpperCase()}
+                  </Text>
+                ) : null}
+              </View>
+              <TouchableOpacity
+                style={styles.reenableButton}
+                onPress={() => handleReenableSource(src.feed_id, src.name)}
+              >
+                <Ionicons name="eye-outline" size={16} color={colors.success} />
+                <Text style={styles.reenableButtonText}>Riabilita</Text>
+              </TouchableOpacity>
+            </View>
+          ))}
+        </View>
+      )}
+
+      {/* Analisi & Demo */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Strumenti</Text>
+
+        {/* Batch Analysis */}
+        <TouchableOpacity
+          style={[styles.toolButton, startingBatch && { opacity: 0.6 }]}
+          onPress={handleBatchAnalysis}
+          disabled={startingBatch}
+        >
+          {startingBatch ? (
+            <ActivityIndicator size="small" color={colors.primary} />
+          ) : (
+            <Ionicons name="sparkles-outline" size={18} color={colors.primary} />
+          )}
+          <View style={{ flex: 1 }}>
+            <Text style={styles.toolButtonTitle}>
+              {startingBatch ? 'Avvio in corso...' : 'Analisi Batch AI'}
+            </Text>
+            <Text style={styles.toolButtonDesc}>
+              Analizza automaticamente tutti gli articoli in attesa (a batch di 5)
+            </Text>
+          </View>
+        </TouchableOpacity>
+
+        {batchAnalysisTask && (batchAnalysisTask.status === 'running' || batchAnalysisTask.status === 'pending' || batchAnalysisTask.status === 'completed') && (
+          <ProgressBar
+            progress={batchAnalysisTask.progress || 0}
+            total={batchAnalysisTask.total || 0}
+            analyzed={batchAnalysisTask.analyzed?.length || 0}
+            errors={batchAnalysisTask.errors?.length || 0}
+            status={batchAnalysisTask.status}
+            startedAt={batchAnalysisTask.created_at}
+            label="Analisi AI Batch"
+            onDismiss={batchAnalysisTask.status === 'completed' || batchAnalysisTask.status === 'error' ? dismissBatchAnalysis : null}
+          />
+        )}
+
+        {/* Demo Article */}
+        <TouchableOpacity
+          style={[styles.toolButton, creatingDemo && { opacity: 0.6 }]}
+          onPress={handleCreateDemo}
+          disabled={creatingDemo}
+        >
+          {creatingDemo ? (
+            <ActivityIndicator size="small" color={colors.accent} />
+          ) : (
+            <Ionicons name="school-outline" size={18} color={colors.accent} />
+          )}
+          <View style={{ flex: 1 }}>
+            <Text style={styles.toolButtonTitle}>
+              {creatingDemo ? 'Creazione...' : 'Crea Articolo Demo'}
+            </Text>
+            <Text style={styles.toolButtonDesc}>
+              Genera un articolo di esempio con analisi completa per esplorare tutte le funzionalità
+            </Text>
+          </View>
+        </TouchableOpacity>
+      </View>
+
       {/* Info */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Informazioni</Text>
+
+        {/* Version Check */}
+        <TouchableOpacity
+          style={[styles.versionCheckButton, checkingVersions && { opacity: 0.6 }]}
+          onPress={handleCheckVersions}
+          disabled={checkingVersions}
+        >
+          {checkingVersions ? (
+            <ActivityIndicator size="small" color={colors.primary} />
+          ) : (
+            <Ionicons name="refresh-outline" size={18} color={colors.primary} />
+          )}
+          <Text style={styles.versionCheckText}>
+            {checkingVersions ? 'Verifica in corso...' : 'Verifica aggiornamenti componenti'}
+          </Text>
+        </TouchableOpacity>
+
+        {versionResults && (
+          <View style={styles.versionResults}>
+            <View style={styles.versionHeader}>
+              <Ionicons
+                name={versionResults.all_up_to_date ? 'checkmark-circle' : 'warning'}
+                size={18}
+                color={versionResults.all_up_to_date ? colors.success : colors.warning}
+              />
+              <Text style={[styles.versionHeaderText, {
+                color: versionResults.all_up_to_date ? colors.success : colors.warning
+              }]}>
+                {versionResults.all_up_to_date
+                  ? 'Tutti i componenti sono aggiornati'
+                  : 'Alcuni componenti hanno aggiornamenti disponibili'}
+              </Text>
+            </View>
+            <Text style={styles.versionPython}>Python {versionResults.python_version}</Text>
+            {versionResults.components.map((comp) => (
+              <View key={comp.package} style={styles.versionRow}>
+                <Ionicons
+                  name={comp.up_to_date === true ? 'checkmark-circle' : comp.up_to_date === false ? 'arrow-up-circle' : 'help-circle-outline'}
+                  size={14}
+                  color={comp.up_to_date === true ? colors.success : comp.up_to_date === false ? colors.warning : colors.textMuted}
+                />
+                <Text style={styles.versionPkg}>{comp.package}</Text>
+                <Text style={styles.versionInstalled}>{comp.installed || '?'}</Text>
+                {comp.up_to_date === false && (
+                  <Text style={styles.versionLatest}> → {comp.latest}</Text>
+                )}
+              </View>
+            ))}
+          </View>
+        )}
+
         <View style={styles.infoRow}>
           <Text style={styles.infoLabel}>Versione</Text>
           <Text style={styles.infoValue}>1.0.0</Text>
@@ -743,5 +955,118 @@ const styles = StyleSheet.create({
     color: colors.primary,
     fontSize: fontSize.md,
     fontWeight: '600',
+  },
+  versionCheckButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    padding: spacing.lg,
+    marginBottom: spacing.md,
+    borderWidth: 1,
+    borderColor: colors.primary + '40',
+  },
+  versionCheckText: {
+    fontSize: fontSize.md,
+    color: colors.primary,
+    fontWeight: '500',
+  },
+  versionResults: {
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  versionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  versionHeaderText: {
+    fontSize: fontSize.sm,
+    fontWeight: '600',
+  },
+  versionPython: {
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+    marginBottom: spacing.sm,
+  },
+  versionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingVertical: spacing.xs,
+  },
+  versionPkg: {
+    flex: 1,
+    fontSize: fontSize.sm,
+    color: colors.text,
+  },
+  versionInstalled: {
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+    fontFamily: 'monospace',
+  },
+  versionLatest: {
+    fontSize: fontSize.sm,
+    color: colors.warning,
+    fontWeight: '600',
+    fontFamily: 'monospace',
+  },
+  // Excluded sources
+  excludedSourceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+  },
+  excludedSourceName: {
+    fontSize: fontSize.md,
+    color: colors.text,
+    fontWeight: '500',
+  },
+  excludedSourceLang: {
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+    marginTop: 2,
+  },
+  reenableButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    backgroundColor: colors.success + '20',
+    borderRadius: borderRadius.md,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+  },
+  reenableButtonText: {
+    fontSize: fontSize.sm,
+    color: colors.success,
+    fontWeight: '600',
+  },
+  // Tools section
+  toolButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    padding: spacing.lg,
+    marginBottom: spacing.sm,
+  },
+  toolButtonTitle: {
+    fontSize: fontSize.md,
+    fontWeight: '600',
+    color: colors.text,
+  },
+  toolButtonDesc: {
+    fontSize: fontSize.sm,
+    color: colors.textMuted,
+    marginTop: 2,
   },
 });

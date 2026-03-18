@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     # Ollama (locale, gratuito — https://ollama.com)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "llama3"
+    OLLAMA_MODEL: str = "llama3.2"
 
     # Google Gemini (gratuito con limiti — https://aistudio.google.com/apikey)
     GEMINI_API_KEY: str = ""

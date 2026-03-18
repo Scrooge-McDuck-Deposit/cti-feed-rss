@@ -59,6 +59,33 @@ const useStore = create((set, get) => ({
   aiStatus: null,
   aiConfig: null,
 
+  // Search
+  searchResults: [],
+  searchTotal: 0,
+  searchPage: 1,
+  searchHasMore: false,
+  searchQuery: null,
+  searchSuggestions: [],
+  isSearching: false,
+
+  // Watchlist
+  watchlist: [],
+  watchlistAlerts: [],
+  watchlistAlertsCount: 0,
+
+  // Favorites
+  favorites: new Set(),
+  favoriteArticles: [],
+
+  // Excluded Sources
+  excludedSources: [],
+
+  // Batch Analysis
+  batchAnalysisTask: null,
+
+  // Refresh progress (feed fetch)
+  refreshProgress: null,
+
   // ── Actions ───────────────────────────────────────────────────────────
 
   setLoading: (loading) => set({ isLoading: loading }),
@@ -156,7 +183,7 @@ const useStore = create((set, get) => ({
   },
 
   refreshArticles: async () => {
-    set({ isRefreshing: true });
+    set({ isRefreshing: true, refreshProgress: { phase: 'fetch', label: 'Scaricamento feed...' } });
     try {
       // Fetcha nuovi articoli dal backend (background task)
       const result = await apiService.fetchArticles();
@@ -164,21 +191,23 @@ const useStore = create((set, get) => ({
       if (result?.task_id) {
         let attempts = 0;
         while (attempts < 60) {
-          await new Promise((r) => setTimeout(r, 2000));
+          await new Promise((r) => setTimeout(r, 1500));
           try {
             const taskStatus = await apiService.getTaskStatus(result.task_id);
+            set({ refreshProgress: { phase: 'fetch', label: 'Scaricamento feed...', ...taskStatus } });
             if (taskStatus.status === 'completed' || taskStatus.status === 'error') break;
           } catch { break; }
           attempts++;
         }
       }
+      set({ refreshProgress: { phase: 'loading', label: 'Caricamento articoli...' } });
       // Ricarica la lista
       await get().loadArticles(1, false);
       await cacheService.setLastSync();
-      set({ lastSync: Date.now(), isRefreshing: false });
+      set({ lastSync: Date.now(), isRefreshing: false, refreshProgress: null });
     } catch (error) {
       console.error('Error refreshing:', error);
-      set({ isRefreshing: false, error: error.message });
+      set({ isRefreshing: false, refreshProgress: null, error: error.message });
     }
   },
 
@@ -359,6 +388,222 @@ const useStore = create((set, get) => ({
     }
   },
 
+  // ── Search Actions ────────────────────────────────────────────────────
+
+  searchArticles: async (searchQuery, page = 1, append = false) => {
+    set({ isSearching: !append, searchQuery: searchQuery });
+    try {
+      const result = await apiService.searchArticles({
+        ...searchQuery,
+        page,
+      });
+      set({
+        searchResults: append
+          ? [...get().searchResults, ...result.results]
+          : result.results,
+        searchTotal: result.total,
+        searchPage: result.page,
+        searchHasMore: result.has_next,
+        searchSuggestions: result.ai_suggestions || [],
+        isSearching: false,
+      });
+      return result;
+    } catch (error) {
+      console.error('Search error:', error);
+      set({ isSearching: false, error: error.message });
+      throw error;
+    }
+  },
+
+  loadMoreSearchResults: async () => {
+    const { searchPage, searchHasMore, searchQuery } = get();
+    if (!searchHasMore || !searchQuery) return;
+    await get().searchArticles(searchQuery, searchPage + 1, true);
+  },
+
+  clearSearch: () => {
+    set({
+      searchResults: [],
+      searchTotal: 0,
+      searchPage: 1,
+      searchHasMore: false,
+      searchQuery: null,
+      searchSuggestions: [],
+    });
+  },
+
+  // ── Favorites Actions ────────────────────────────────────────────────
+
+  loadFavorites: async () => {
+    try {
+      const data = await apiService.getFavorites();
+      set({
+        favorites: new Set(data.favorite_ids || []),
+        favoriteArticles: data.articles || [],
+      });
+    } catch (error) {
+      console.error('Favorites load error:', error);
+    }
+  },
+
+  toggleFavorite: async (articleId) => {
+    const { favorites } = get();
+    const isFav = favorites.has(articleId);
+    try {
+      if (isFav) {
+        await apiService.removeFavorite(articleId);
+        const newFavs = new Set(favorites);
+        newFavs.delete(articleId);
+        set({
+          favorites: newFavs,
+          favoriteArticles: get().favoriteArticles.filter(a => a.id !== articleId),
+        });
+      } else {
+        await apiService.addFavorite(articleId);
+        const newFavs = new Set(favorites);
+        newFavs.add(articleId);
+        set({ favorites: newFavs });
+        // Reload to get full article data
+        const data = await apiService.getFavorites();
+        set({ favoriteArticles: data.articles || [] });
+      }
+    } catch (error) {
+      console.error('Toggle favorite error:', error);
+    }
+  },
+
+  isFavorite: (articleId) => {
+    return get().favorites.has(articleId);
+  },
+
+  // ── Excluded Sources Actions ──────────────────────────────────────────
+
+  loadExcludedSources: async () => {
+    try {
+      const data = await apiService.getExcludedSources();
+      set({ excludedSources: data.excluded || [] });
+    } catch (error) {
+      console.error('Excluded sources load error:', error);
+    }
+  },
+
+  excludeSource: async (feedId) => {
+    try {
+      await apiService.excludeSource(feedId);
+      await get().loadExcludedSources();
+      // Reload articles to reflect the change
+      await get().loadArticles(1, false);
+    } catch (error) {
+      console.error('Exclude source error:', error);
+      throw error;
+    }
+  },
+
+  reenableSource: async (feedId) => {
+    try {
+      await apiService.reenableSource(feedId);
+      await get().loadExcludedSources();
+      await get().loadArticles(1, false);
+    } catch (error) {
+      console.error('Reenable source error:', error);
+      throw error;
+    }
+  },
+
+  // ── Batch Analysis Actions ────────────────────────────────────────────
+
+  startBatchAnalysis: async (articleIds = null, batchSize = 5) => {
+    try {
+      const result = await apiService.analyzeBatch(articleIds, batchSize);
+      set({ batchAnalysisTask: result });
+
+      // Poll for progress (faster interval for responsive UI)
+      if (result?.task_id) {
+        const poll = async () => {
+          let attempts = 0;
+          while (attempts < 200) {
+            await new Promise((r) => setTimeout(r, 1500));
+            try {
+              const status = await apiService.getTaskStatus(result.task_id);
+              set({ batchAnalysisTask: status });
+              if (status.status === 'completed' || status.status === 'error') {
+                // Reload articles after completion
+                await get().loadArticles(1, false);
+                break;
+              }
+            } catch { break; }
+            attempts++;
+          }
+        };
+        poll(); // fire and forget
+      }
+
+      return result;
+    } catch (error) {
+      console.error('Batch analysis error:', error);
+      throw error;
+    }
+  },
+
+  dismissBatchAnalysis: () => {
+    set({ batchAnalysisTask: null });
+  },
+
+  // ── Demo Actions ──────────────────────────────────────────────────────
+
+  createDemoArticle: async () => {
+    try {
+      const article = await apiService.createDemoArticle();
+      return article;
+    } catch (error) {
+      console.error('Demo article error:', error);
+      throw error;
+    }
+  },
+
+  // ── Watchlist Actions ─────────────────────────────────────────────────
+
+  loadWatchlist: async () => {
+    try {
+      const watchlist = await apiService.getWatchlist();
+      set({ watchlist });
+    } catch (error) {
+      console.error('Watchlist load error:', error);
+    }
+  },
+
+  addWatchlistAsset: async (assetType, value, label) => {
+    const asset = await apiService.addWatchlistAsset(assetType, value, label);
+    set((state) => ({ watchlist: [...state.watchlist, asset] }));
+    return asset;
+  },
+
+  removeWatchlistAsset: async (assetId) => {
+    await apiService.removeWatchlistAsset(assetId);
+    set((state) => ({
+      watchlist: state.watchlist.filter((a) => a.id !== assetId),
+    }));
+  },
+
+  toggleWatchlistAsset: async (assetId) => {
+    const updated = await apiService.toggleWatchlistAsset(assetId);
+    set((state) => ({
+      watchlist: state.watchlist.map((a) => (a.id === assetId ? updated : a)),
+    }));
+  },
+
+  loadWatchlistAlerts: async () => {
+    try {
+      const data = await apiService.getWatchlistAlerts();
+      set({
+        watchlistAlerts: data.alerts || [],
+        watchlistAlertsCount: data.total_alerts || 0,
+      });
+    } catch (error) {
+      console.error('Watchlist alerts error:', error);
+    }
+  },
+
   // ── Init ──────────────────────────────────────────────────────────────
 
   initialize: async () => {
@@ -368,8 +613,13 @@ const useStore = create((set, get) => ({
       get().loadStats(),
       get().loadCategories(),
       get().loadAiStatus(),
+      get().loadWatchlist(),
+      get().loadWatchlistAlerts(),
+      get().loadFavorites(),
+      get().loadExcludedSources(),
     ]);
-    await get().loadArticles(1, false);
+    // Non carichiamo articoli automaticamente:
+    // l'utente li cerca on-demand tramite ricerca o categoria
   },
 }));
 
