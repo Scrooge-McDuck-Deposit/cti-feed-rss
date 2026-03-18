@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Response
 
 from app.data.cache_manager import cache_manager
 from app.config import settings
@@ -36,10 +37,57 @@ from app.services.categorizer import categorizer_service
 from app.services.rss_service import rss_service
 from app.services.stix_service import stix_service
 from app.services.opml_service import import_from_opml_url, import_from_opml_content
+from app.services.misp_service import misp_service
+from app.services.yara_service import yara_service
+from app.services.sigma_service import sigma_service
+from app.services.taxii_service import taxii_service, TAXII_MEDIA_TYPE, COLLECTION_ID, API_ROOT
+from app.services.thehive_service import thehive_service
+from app.services.qradar_service import qradar_service
+from app.services.elastic_service import elastic_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# ── Background Task Registry ──────────────────────────────────────────────────
+
+_task_registry: dict[str, dict] = {}
+
+
+async def _run_fetch_task(task_id: str, feed_id: Optional[str] = None):
+    """Background worker for article fetching."""
+    _task_registry[task_id]["status"] = "running"
+    try:
+        if feed_id:
+            articles = await rss_service.fetch_feed_by_id(feed_id)
+        else:
+            articles = await rss_service.fetch_all_feeds()
+
+        new_count = 0
+        for article in articles:
+            existing = cache_manager.get_article(article.id)
+            if not existing:
+                feed = get_feed_by_id(article.feed_id)
+                analyzed = ArticleAnalyzed(
+                    **article.model_dump(),
+                    feed_name=feed.name if feed else "",
+                )
+                cache_manager.save_article(analyzed)
+                new_count += 1
+
+        _task_registry[task_id].update({
+            "status": "completed",
+            "total_fetched": len(articles),
+            "new_articles": new_count,
+            "completed_at": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        logger.error("Background fetch task %s failed: %s", task_id, e)
+        _task_registry[task_id].update({
+            "status": "error",
+            "error": str(e),
+            "completed_at": datetime.utcnow().isoformat(),
+        })
 
 
 # ── Feed Endpoints ─────────────────────────────────────────────────────────────
@@ -82,37 +130,36 @@ async def get_feed(feed_id: str):
 
 
 @router.post("/articles/fetch")
-async def fetch_articles(feed_id: Optional[str] = None):
-    """Fetcha gli articoli dai feed RSS.
+async def fetch_articles(
+    background_tasks: BackgroundTasks,
+    feed_id: Optional[str] = None,
+):
+    """Fetcha gli articoli dai feed RSS in background.
 
-    Se feed_id è specificato, fetcha solo quel feed.
-    Altrimenti fetcha tutti i feed attivi.
+    Restituisce un task_id per il polling dello stato.
     """
-    if feed_id:
-        articles = await rss_service.fetch_feed_by_id(feed_id)
-    else:
-        articles = await rss_service.fetch_all_feeds()
-
-    if not articles:
-        return {"message": "Nessun articolo trovato", "count": 0}
-
-    # Salva gli articoli in cache come pending
-    new_count = 0
-    for article in articles:
-        existing = cache_manager.get_article(article.id)
-        if not existing:
-            analyzed = ArticleAnalyzed(
-                **article.model_dump(),
-                feed_name=get_feed_by_id(article.feed_id).name if get_feed_by_id(article.feed_id) else "",
-            )
-            cache_manager.save_article(analyzed)
-            new_count += 1
-
-    return {
-        "message": f"Fetch completato",
-        "total_fetched": len(articles),
-        "new_articles": new_count,
+    task_id = uuid.uuid4().hex[:12]
+    _task_registry[task_id] = {
+        "task_id": task_id,
+        "status": "pending",
+        "created_at": datetime.utcnow().isoformat(),
+        "feed_id": feed_id,
     }
+    background_tasks.add_task(_run_fetch_task, task_id, feed_id)
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "message": "Fetch avviato in background",
+    }
+
+
+@router.get("/tasks/{task_id}")
+async def get_task_status(task_id: str):
+    """Restituisce lo stato di un task in background."""
+    task = _task_registry.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task non trovato")
+    return task
 
 
 @router.get("/articles", response_model=ArticleListResponse)
@@ -125,44 +172,14 @@ async def list_articles(
     status: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
 ):
-    """Restituisce gli articoli con paginazione e filtri."""
-    all_articles = cache_manager.get_all_cached_articles()
-
-    # Filtri
-    if category:
-        try:
-            cat = ThreatCategory(category)
-            all_articles = [
-                a for a in all_articles
-                if a.analysis and a.analysis.threat_category == cat
-            ]
-        except ValueError:
-            pass
-
-    if severity:
-        all_articles = [
-            a for a in all_articles
-            if a.analysis and a.analysis.severity.value == severity
-        ]
-
-    if feed_id:
-        all_articles = [a for a in all_articles if a.feed_id == feed_id]
-
-    if status:
-        try:
-            st = ArticleStatus(status)
-            all_articles = [a for a in all_articles if a.status == st]
-        except ValueError:
-            pass
-
-    if search:
-        search_lower = search.lower()
-        all_articles = [
-            a for a in all_articles
-            if search_lower in a.title.lower()
-            or search_lower in a.summary.lower()
-            or (a.analysis and search_lower in (a.analysis.summary_it or "").lower())
-        ]
+    """Restituisce gli articoli con paginazione e filtri (ottimizzato con indice)."""
+    all_articles = cache_manager.get_filtered_articles(
+        category=category,
+        severity=severity,
+        feed_id=feed_id,
+        status=status,
+        search=search,
+    )
 
     # Ordina per data (più recenti prima)
     all_articles.sort(
@@ -487,6 +504,187 @@ async def import_opml(url: Optional[str] = Query(None, description="URL del file
     return result
 
 
+# ── Export Endpoints ────────────────────────────────────────────────────────────
+
+
+@router.get("/articles/{article_id}/export/misp")
+async def export_misp(article_id: str):
+    """Genera un MISP Event JSON da un articolo analizzato."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    if not article.analysis:
+        raise HTTPException(status_code=400, detail="Articolo non ancora analizzato")
+    return misp_service.build_misp_event(article)
+
+
+@router.get("/articles/{article_id}/export/yara")
+async def export_yara(article_id: str):
+    """Genera regole YARA da un articolo analizzato."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    if not article.analysis:
+        raise HTTPException(status_code=400, detail="Articolo non ancora analizzato")
+    rules = yara_service.generate_rules(article)
+    return Response(content=rules, media_type="text/x-yara")
+
+
+@router.get("/articles/{article_id}/export/sigma")
+async def export_sigma(article_id: str):
+    """Genera regole Sigma da un articolo analizzato."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    if not article.analysis:
+        raise HTTPException(status_code=400, detail="Articolo non ancora analizzato")
+    rules = sigma_service.generate_rules(article)
+    return Response(content=rules, media_type="application/x-yaml")
+
+
+@router.post("/articles/{article_id}/export/thehive")
+async def export_thehive(article_id: str):
+    """Invia un alert a TheHive da un articolo analizzato."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    if not article.analysis:
+        raise HTTPException(status_code=400, detail="Articolo non ancora analizzato")
+    result = await thehive_service.push_alert(article)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
+
+
+@router.get("/articles/{article_id}/export/thehive")
+async def preview_thehive(article_id: str):
+    """Preview del payload TheHive senza invio."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    if not article.analysis:
+        raise HTTPException(status_code=400, detail="Articolo non ancora analizzato")
+    return thehive_service.build_alert(article)
+
+
+@router.post("/articles/{article_id}/export/qradar")
+async def export_qradar(article_id: str):
+    """Invia IoC ai reference-set QRadar."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    if not article.analysis:
+        raise HTTPException(status_code=400, detail="Articolo non ancora analizzato")
+    result = await qradar_service.push_indicators(article)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
+
+
+@router.get("/articles/{article_id}/export/qradar")
+async def preview_qradar(article_id: str):
+    """Preview del payload QRadar senza invio."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    if not article.analysis:
+        raise HTTPException(status_code=400, detail="Articolo non ancora analizzato")
+    return qradar_service.build_export_payload(article)
+
+
+@router.post("/articles/{article_id}/export/elasticsearch")
+async def export_elasticsearch(article_id: str):
+    """Indicizza un articolo in Elasticsearch."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    if not article.analysis:
+        raise HTTPException(status_code=400, detail="Articolo non ancora analizzato")
+    result = await elastic_service.index_article(article)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
+
+
+@router.get("/articles/{article_id}/export/elasticsearch")
+async def preview_elasticsearch(article_id: str):
+    """Preview del documento ECS senza indicizzazione."""
+    article = cache_manager.get_article(article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Articolo non trovato")
+    if not article.analysis:
+        raise HTTPException(status_code=400, detail="Articolo non ancora analizzato")
+    return elastic_service.build_ecs_document(article)
+
+
+# ── TAXII 2.1 Endpoints ───────────────────────────────────────────────────────
+
+
+@router.get("/taxii2")
+async def taxii_discovery(request_obj: "starlette.requests.Request" = None):
+    """TAXII 2.1 Discovery endpoint."""
+    from starlette.requests import Request
+    # Build base URL from request if available
+    base_url = ""
+    return Response(
+        content=json.dumps(taxii_service.get_discovery(base_url)),
+        media_type=TAXII_MEDIA_TYPE,
+    )
+
+
+@router.get("/taxii2/collections")
+async def taxii_collections():
+    """List available TAXII 2.1 collections."""
+    return Response(
+        content=json.dumps(taxii_service.get_collections()),
+        media_type=TAXII_MEDIA_TYPE,
+    )
+
+
+@router.get("/taxii2/collections/{collection_id}")
+async def taxii_collection(collection_id: str):
+    """Get a specific TAXII collection."""
+    result = taxii_service.get_collection(collection_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    return Response(
+        content=json.dumps(result),
+        media_type=TAXII_MEDIA_TYPE,
+    )
+
+
+@router.get("/taxii2/collections/{collection_id}/objects")
+async def taxii_objects(
+    collection_id: str,
+    added_after: Optional[str] = Query(None),
+    type: Optional[str] = Query(None, alias="match[type]"),
+    limit: int = Query(50, ge=1, le=500),
+    next: Optional[str] = Query(None),
+):
+    """Get STIX objects from a TAXII collection."""
+    result = taxii_service.get_objects(
+        collection_id,
+        added_after=added_after,
+        object_type=type,
+        limit=limit,
+        next_cursor=next,
+    )
+    return Response(
+        content=json.dumps(result, default=str),
+        media_type=TAXII_MEDIA_TYPE,
+    )
+
+
+@router.get("/taxii2/collections/{collection_id}/manifest")
+async def taxii_manifest(collection_id: str, limit: int = Query(50, ge=1, le=500)):
+    """Get the manifest of objects in a TAXII collection."""
+    result = taxii_service.get_manifest(collection_id, limit=limit)
+    return Response(
+        content=json.dumps(result, default=str),
+        media_type=TAXII_MEDIA_TYPE,
+    )
+
+
 # ── AI Status ──────────────────────────────────────────────────────────────────
 
 
@@ -518,3 +716,51 @@ async def ai_status():
             "gemini (gratis con limiti), oppure openai (a pagamento)."
         ),
     }
+
+
+@router.get("/ai/config")
+async def get_ai_config():
+    """Restituisce la configurazione AI corrente (senza esporre chiavi intere)."""
+    return ai_service.get_config()
+
+
+@router.post("/ai/config")
+async def update_ai_config(body: dict):
+    """Aggiorna la configurazione AI a runtime dall'interfaccia mobile.
+
+    Campi supportati nel body JSON:
+    - engine: "ollama" | "gemini" | "openai" | ""
+    - ollama_base_url, ollama_model
+    - gemini_api_key, gemini_model
+    - openai_api_key, openai_model
+    """
+    result = ai_service.update_config(body)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.post("/ai/test")
+async def test_ai_connection():
+    """Testa la connessione al motore AI configurato."""
+    engine = ai_service.engine
+    if not engine:
+        return {"success": False, "message": "Nessun motore AI configurato"}
+
+    try:
+        response = await ai_service._chat_completion(
+            system_prompt="Rispondi con un JSON: {\"status\": \"ok\"}",
+            user_prompt="Test connessione. Rispondi solo con il JSON richiesto.",
+            temperature=0.0,
+            max_tokens=50,
+        )
+        if response:
+            return {
+                "success": True,
+                "engine": engine,
+                "model": ai_service.model_name,
+                "message": f"Connessione a {engine} riuscita",
+            }
+        return {"success": False, "message": "Risposta vuota dal motore AI"}
+    except Exception as e:
+        return {"success": False, "engine": engine, "message": str(e)}

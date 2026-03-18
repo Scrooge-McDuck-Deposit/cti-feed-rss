@@ -7,6 +7,9 @@ import { create } from 'zustand';
 import apiService from '../services/api';
 import cacheService from '../services/cacheService';
 
+// Request deduplication tracker
+let _loadArticlesInFlight = null;
+
 const useStore = create((set, get) => ({
   // ── State ─────────────────────────────────────────────────────────────
 
@@ -54,6 +57,7 @@ const useStore = create((set, get) => ({
 
   // AI Status
   aiStatus: null,
+  aiConfig: null,
 
   // ── Actions ───────────────────────────────────────────────────────────
 
@@ -89,6 +93,12 @@ const useStore = create((set, get) => ({
 
   loadArticles: async (page = 1, append = false) => {
     const { filters } = get();
+
+    // Deduplication: if same request is in flight, skip
+    const requestKey = JSON.stringify({ page, append, filters });
+    if (_loadArticlesInFlight === requestKey) return;
+    _loadArticlesInFlight = requestKey;
+
     set({ isLoading: !append, error: null });
 
     try {
@@ -128,11 +138,14 @@ const useStore = create((set, get) => ({
             isLoading: false,
             isOffline: true,
           });
+          _loadArticlesInFlight = null;
           return;
         }
       }
 
       set({ isLoading: false, error: error.message });
+    } finally {
+      _loadArticlesInFlight = null;
     }
   },
 
@@ -145,8 +158,20 @@ const useStore = create((set, get) => ({
   refreshArticles: async () => {
     set({ isRefreshing: true });
     try {
-      // Fetcha nuovi articoli dal backend
-      await apiService.fetchArticles();
+      // Fetcha nuovi articoli dal backend (background task)
+      const result = await apiService.fetchArticles();
+      // Poll for task completion if backend returns task_id
+      if (result?.task_id) {
+        let attempts = 0;
+        while (attempts < 60) {
+          await new Promise((r) => setTimeout(r, 2000));
+          try {
+            const taskStatus = await apiService.getTaskStatus(result.task_id);
+            if (taskStatus.status === 'completed' || taskStatus.status === 'error') break;
+          } catch { break; }
+          attempts++;
+        }
+      }
       // Ricarica la lista
       await get().loadArticles(1, false);
       await cacheService.setLastSync();
@@ -296,6 +321,29 @@ const useStore = create((set, get) => ({
     } catch (error) {
       set({ aiStatus: { available: false, message: 'Backend non raggiungibile' } });
     }
+  },
+
+  loadAiConfig: async () => {
+    try {
+      const config = await apiService.getAiConfig();
+      set({ aiConfig: config });
+    } catch (error) {
+      // ignore
+    }
+  },
+
+  updateAiConfig: async (config) => {
+    const result = await apiService.updateAiConfig(config);
+    if (result.config) {
+      set({ aiConfig: result.config });
+    }
+    // Refresh status after config change
+    await get().loadAiStatus();
+    return result;
+  },
+
+  testAiConnection: async () => {
+    return apiService.testAiConnection();
   },
 
   importOpml: async (url) => {

@@ -8,8 +8,14 @@ feedparser>=6.0.0
 beautifulsoup4>=4.12.0
 stix2>=3.0.0
 python-dotenv>=1.0.0
+pyyaml>=6.0.0
 
 # AI engines (installare solo quello che si usa)
 # openai>=1.6.0        # pip install openai (solo per engine OpenAI)
 # google-generativeai  # non necessario: Gemini usa API REST direttamente
 # Ollama: nessun pacchetto necessario, usa API REST locale
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+httpx>=0.25.0

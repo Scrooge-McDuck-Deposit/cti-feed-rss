@@ -17,6 +17,7 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import useStore from '../store/ArticleStore';
 import StixViewer from '../components/StixViewer';
+import apiService from '../services/api';
 import { colors, spacing, fontSize, borderRadius, shadows } from '../theme';
 import { severityColor, categoryColor } from '../theme';
 import {
@@ -40,6 +41,8 @@ export default function ArticleDetailScreen({ route }) {
   const [activeTab, setActiveTab] = useState('summary');
   const [analyzing, setAnalyzing] = useState(false);
   const [generatingReport, setGeneratingReport] = useState(false);
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const [exporting, setExporting] = useState(null);
 
   useEffect(() => {
     selectArticle(articleId);
@@ -84,6 +87,49 @@ export default function ArticleDetailScreen({ route }) {
       // Utente ha cancellato
     }
   }, [article]);
+
+  const handleExport = useCallback(async (format) => {
+    setExporting(format);
+    setShowExportMenu(false);
+    try {
+      let data;
+      let shareContent;
+      switch (format) {
+        case 'misp':
+          data = await apiService.getArticleMISP(articleId);
+          shareContent = JSON.stringify(data, null, 2);
+          break;
+        case 'yara':
+          data = await apiService.getArticleYARA(articleId);
+          shareContent = typeof data === 'string' ? data : JSON.stringify(data);
+          break;
+        case 'sigma':
+          data = await apiService.getArticleSigma(articleId);
+          shareContent = typeof data === 'string' ? data : JSON.stringify(data);
+          break;
+        case 'thehive':
+          const thResult = await apiService.exportToTheHive(articleId);
+          Alert.alert('TheHive', thResult.success ? 'Alert inviato con successo' : thResult.error || 'Errore');
+          return;
+        case 'qradar':
+          const qrResult = await apiService.exportToQRadar(articleId);
+          Alert.alert('QRadar', qrResult.success ? 'IoC esportati con successo' : qrResult.error || 'Errore');
+          return;
+        case 'elasticsearch':
+          const esResult = await apiService.exportToElasticsearch(articleId);
+          Alert.alert('Elasticsearch', esResult.success ? 'Articolo indicizzato' : esResult.error || 'Errore');
+          return;
+        default:
+          return;
+      }
+      // Share file-like exports
+      await Share.share({ message: shareContent, title: `${article.title} - ${format.toUpperCase()}` });
+    } catch (error) {
+      Alert.alert('Errore Export', error.message || 'Impossibile esportare');
+    } finally {
+      setExporting(null);
+    }
+  }, [articleId, article]);
 
   if (isLoading && !article) {
     return (
@@ -213,7 +259,45 @@ export default function ArticleDetailScreen({ route }) {
           >
             <Ionicons name="open-outline" size={20} color={colors.primary} />
           </TouchableOpacity>
+
+          {hasAnalysis && (
+            <TouchableOpacity
+              style={styles.iconButton}
+              onPress={() => setShowExportMenu(!showExportMenu)}
+            >
+              {exporting ? (
+                <ActivityIndicator size="small" color={colors.primary} />
+              ) : (
+                <Ionicons name="download-outline" size={20} color={colors.primary} />
+              )}
+            </TouchableOpacity>
+          )}
         </View>
+
+        {/* Export Menu */}
+        {showExportMenu && hasAnalysis && (
+          <View style={styles.exportMenu}>
+            <Text style={styles.exportMenuTitle}>Esporta come...</Text>
+            {[
+              { id: 'misp', label: 'MISP Event JSON', icon: 'shield-outline' },
+              { id: 'yara', label: 'Regole YARA', icon: 'code-outline' },
+              { id: 'sigma', label: 'Regole Sigma', icon: 'analytics-outline' },
+              { id: 'thehive', label: 'Invia a TheHive', icon: 'send-outline' },
+              { id: 'qradar', label: 'Invia a QRadar', icon: 'server-outline' },
+              { id: 'elasticsearch', label: 'Invia a Elasticsearch', icon: 'cloud-upload-outline' },
+            ].map((opt) => (
+              <TouchableOpacity
+                key={opt.id}
+                style={styles.exportMenuItem}
+                onPress={() => handleExport(opt.id)}
+                disabled={exporting === opt.id}
+              >
+                <Ionicons name={opt.icon} size={18} color={colors.primary} />
+                <Text style={styles.exportMenuItemText}>{opt.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
       </View>
 
       {/* Tabs */}
@@ -932,5 +1016,30 @@ const styles = StyleSheet.create({
     fontSize: fontSize.md,
     color: colors.textMuted,
     textAlign: 'center',
+  },
+  // Export menu
+  exportMenu: {
+    marginTop: spacing.md,
+    backgroundColor: colors.surfaceLight || '#f5f5f5',
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+  },
+  exportMenuTitle: {
+    fontSize: fontSize.sm,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    marginBottom: spacing.sm,
+  },
+  exportMenuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.sm,
+    borderRadius: borderRadius.sm,
+  },
+  exportMenuItemText: {
+    fontSize: fontSize.md,
+    color: colors.text,
   },
 });

@@ -129,10 +129,25 @@ class ApiService {
     return this._fetch('/cache', { method: 'DELETE' });
   }
 
-  // ── AI Status ──────────────────────────────────────────────────────
+  // ── AI Status & Config ──────────────────────────────────────────────
 
   async getAiStatus() {
     return this._fetch('/ai/status');
+  }
+
+  async getAiConfig() {
+    return this._fetch('/ai/config');
+  }
+
+  async updateAiConfig(config) {
+    return this._fetch('/ai/config', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    });
+  }
+
+  async testAiConnection() {
+    return this._fetch('/ai/test', { method: 'POST' });
   }
 
   // ── OPML Import ────────────────────────────────────────────────────
@@ -141,6 +156,38 @@ class ApiService {
     return this._fetch(`/feeds/import-opml?url=${encodeURIComponent(opmlUrl)}`, {
       method: 'POST',
     });
+  }
+
+  // ── Background Tasks ──────────────────────────────────────────────
+
+  async getTaskStatus(taskId) {
+    return this._fetch(`/tasks/${taskId}`);
+  }
+
+  // ── SOC Exports ───────────────────────────────────────────────────
+
+  async getArticleMISP(articleId) {
+    return this._fetch(`/articles/${articleId}/export/misp`);
+  }
+
+  async getArticleYARA(articleId) {
+    return this._fetch(`/articles/${articleId}/export/yara`);
+  }
+
+  async getArticleSigma(articleId) {
+    return this._fetch(`/articles/${articleId}/export/sigma`);
+  }
+
+  async exportToTheHive(articleId) {
+    return this._fetch(`/articles/${articleId}/export/thehive`, { method: 'POST' });
+  }
+
+  async exportToQRadar(articleId) {
+    return this._fetch(`/articles/${articleId}/export/qradar`, { method: 'POST' });
+  }
+
+  async exportToElasticsearch(articleId) {
+    return this._fetch(`/articles/${articleId}/export/elasticsearch`, { method: 'POST' });
   }
 }
 

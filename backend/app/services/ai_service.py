@@ -94,22 +94,72 @@ class AIService:
 
     def __init__(self) -> None:
         self._openai_client = None
+        # Runtime overrides (impostabili dall'interfaccia mobile)
+        self._runtime_engine: str | None = None
+        self._runtime_openai_key: str | None = None
+        self._runtime_openai_model: str | None = None
+        self._runtime_gemini_key: str | None = None
+        self._runtime_gemini_model: str | None = None
+        self._runtime_ollama_url: str | None = None
+        self._runtime_ollama_model: str | None = None
+
+    # ── Runtime config API ──────────────────────────────────────────
+
+    def get_config(self) -> dict:
+        """Restituisce la configurazione AI corrente (senza esporre chiavi intere)."""
+        return {
+            "engine": self._effective_engine_name(),
+            "ollama_base_url": self._runtime_ollama_url or settings.OLLAMA_BASE_URL,
+            "ollama_model": self._runtime_ollama_model or settings.OLLAMA_MODEL,
+            "gemini_model": self._runtime_gemini_model or settings.GEMINI_MODEL,
+            "gemini_api_key_set": bool(self._runtime_gemini_key or settings.GEMINI_API_KEY),
+            "openai_model": self._runtime_openai_model or settings.OPENAI_MODEL,
+            "openai_api_key_set": bool(self._runtime_openai_key or settings.OPENAI_API_KEY),
+        }
+
+    def update_config(self, data: dict) -> dict:
+        """Aggiorna la configurazione AI a runtime."""
+        if "engine" in data:
+            val = data["engine"].strip().lower()
+            if val not in ("ollama", "gemini", "openai", ""):
+                return {"error": "Engine non valido. Usa: ollama, gemini, openai, o vuoto."}
+            self._runtime_engine = val
+        if "ollama_base_url" in data:
+            self._runtime_ollama_url = data["ollama_base_url"].strip()
+        if "ollama_model" in data:
+            self._runtime_ollama_model = data["ollama_model"].strip()
+        if "gemini_api_key" in data:
+            self._runtime_gemini_key = data["gemini_api_key"].strip()
+        if "gemini_model" in data:
+            self._runtime_gemini_model = data["gemini_model"].strip()
+        if "openai_api_key" in data:
+            self._runtime_openai_key = data["openai_api_key"].strip()
+            self._openai_client = None  # Reset cached client
+        if "openai_model" in data:
+            self._runtime_openai_model = data["openai_model"].strip()
+        return {"success": True, "config": self.get_config()}
+
+    def _effective_engine_name(self) -> str:
+        """Restituisce il nome del motore tenendo conto degli override runtime."""
+        if self._runtime_engine is not None:
+            return self._runtime_engine
+        return settings.AI_ENGINE.lower().strip()
 
     @property
     def engine(self) -> str:
         """Restituisce il motore AI configurato, o '' se nessuno."""
-        engine = settings.AI_ENGINE.lower().strip()
-        if engine == "openai" and settings.OPENAI_API_KEY:
+        engine = self._effective_engine_name()
+        if engine == "openai" and (self._runtime_openai_key or settings.OPENAI_API_KEY):
             return "openai"
-        if engine == "gemini" and settings.GEMINI_API_KEY:
+        if engine == "gemini" and (self._runtime_gemini_key or settings.GEMINI_API_KEY):
             return "gemini"
         if engine == "ollama":
             return "ollama"
-        # Auto-detect se AI_ENGINE è vuoto ma ci sono credenziali
+        # Auto-detect se engine è vuoto ma ci sono credenziali
         if not engine:
-            if settings.OPENAI_API_KEY:
+            if self._runtime_openai_key or settings.OPENAI_API_KEY:
                 return "openai"
-            if settings.GEMINI_API_KEY:
+            if self._runtime_gemini_key or settings.GEMINI_API_KEY:
                 return "gemini"
         return ""
 
@@ -123,23 +173,20 @@ class AIService:
         """Restituisce il nome del modello in uso."""
         e = self.engine
         if e == "openai":
-            return settings.OPENAI_MODEL
+            return self._runtime_openai_model or settings.OPENAI_MODEL
         if e == "gemini":
-            return settings.GEMINI_MODEL
+            return self._runtime_gemini_model or settings.GEMINI_MODEL
         if e == "ollama":
-            return settings.OLLAMA_MODEL
+            return self._runtime_ollama_model or settings.OLLAMA_MODEL
         return ""
 
     # ── Ollama Model Update ─────────────────────────────────────────────
 
     async def check_ollama_update(self) -> dict:
-        """Controlla se il modello Ollama ha aggiornamenti e lo aggiorna.
-
-        Usa `POST /api/pull` di Ollama che scarica il modello se mancante
-        o aggiorna se c'è una versione più recente.
-        """
-        model = settings.OLLAMA_MODEL
-        url = f"{settings.OLLAMA_BASE_URL}/api/pull"
+        """Controlla se il modello Ollama ha aggiornamenti e lo aggiorna."""
+        model = self._runtime_ollama_model or settings.OLLAMA_MODEL
+        base_url = self._runtime_ollama_url or settings.OLLAMA_BASE_URL
+        url = f"{base_url}/api/pull"
         logger.info("🔄 Controllo aggiornamenti Ollama per '%s'...", model)
 
         try:
@@ -191,10 +238,12 @@ class AIService:
 
     async def _openai_chat(self, system: str, user: str, temperature: float, max_tokens: int) -> str | None:
         from openai import AsyncOpenAI
-        if self._openai_client is None:
-            self._openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        api_key = self._runtime_openai_key or settings.OPENAI_API_KEY
+        model = self._runtime_openai_model or settings.OPENAI_MODEL
+        if self._openai_client is None or self._runtime_openai_key:
+            self._openai_client = AsyncOpenAI(api_key=api_key)
         response = await self._openai_client.chat.completions.create(
-            model=settings.OPENAI_MODEL,
+            model=model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=temperature,
             max_tokens=max_tokens,
@@ -203,9 +252,11 @@ class AIService:
         return response.choices[0].message.content
 
     async def _gemini_chat(self, system: str, user: str, temperature: float, max_tokens: int) -> str | None:
+        api_key = self._runtime_gemini_key or settings.GEMINI_API_KEY
+        model = self._runtime_gemini_model or settings.GEMINI_MODEL
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
+            f"{model}:generateContent?key={api_key}"
         )
         payload = {
             "system_instruction": {"parts": [{"text": system}]},
@@ -226,9 +277,11 @@ class AIService:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
 
     async def _ollama_chat(self, system: str, user: str, temperature: float, max_tokens: int) -> str | None:
-        url = f"{settings.OLLAMA_BASE_URL}/api/chat"
+        base_url = self._runtime_ollama_url or settings.OLLAMA_BASE_URL
+        model = self._runtime_ollama_model or settings.OLLAMA_MODEL
+        url = f"{base_url}/api/chat"
         payload = {
-            "model": settings.OLLAMA_MODEL,
+            "model": model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "stream": False,
             "format": "json",

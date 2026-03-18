@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 from app.api.routes import router
 from app.config import settings
@@ -55,6 +56,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Gzip compression for API responses (min 500 bytes)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # Registra routes
 app.include_router(router, prefix="/api/v1")

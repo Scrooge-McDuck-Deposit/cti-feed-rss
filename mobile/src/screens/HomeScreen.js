@@ -2,7 +2,7 @@
  * Dashboard principale - panoramica delle minacce CTI.
  */
 
-import React, { useEffect, useCallback } from 'react';
+import React, { useEffect, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -39,14 +39,44 @@ export default function HomeScreen({ navigation }) {
     await loadStats();
   }, []);
 
-  // Articoli recenti (top 5)
-  const recentArticles = articles
-    .filter((a) => a.status === 'analyzed' && a.analysis)
-    .slice(0, 5);
+  // Articoli recenti (top 5) — memoized
+  const recentArticles = useMemo(
+    () => articles.filter((a) => a.status === 'analyzed' && a.analysis).slice(0, 5),
+    [articles]
+  );
 
-  // Distribuzione per severità
-  const severityData = stats?.articles_by_severity || {};
-  const categoryData = stats?.articles_by_category || {};
+  // Distribuzione per severità — memoized
+  const severityData = useMemo(() => stats?.articles_by_severity || {}, [stats]);
+  const categoryData = useMemo(() => stats?.articles_by_category || {}, [stats]);
+
+  const sortedSeverity = useMemo(
+    () => Object.entries(severityData).sort((a, b) => b[1] - a[1]),
+    [severityData]
+  );
+  const sortedCategories = useMemo(
+    () => Object.entries(categoryData).sort((a, b) => b[1] - a[1]).slice(0, 8),
+    [categoryData]
+  );
+
+  const handleCategoryPress = useCallback(
+    (cat) => {
+      navigation.navigate('Feed', {
+        screen: 'FeedList',
+        params: { category: cat },
+      });
+    },
+    [navigation]
+  );
+
+  const handleArticlePress = useCallback(
+    (article) => {
+      navigation.navigate('Feed', {
+        screen: 'ArticleDetail',
+        params: { articleId: article.id, title: article.title },
+      });
+    },
+    [navigation]
+  );
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -111,9 +141,7 @@ export default function HomeScreen({ navigation }) {
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Distribuzione Severità</Text>
             <View style={styles.severityRow}>
-              {Object.entries(severityData)
-                .sort((a, b) => b[1] - a[1])
-                .map(([sev, count]) => (
+              {sortedSeverity.map(([sev, count]) => (
                   <View key={sev} style={styles.severityItem}>
                     <View
                       style={[
@@ -134,19 +162,11 @@ export default function HomeScreen({ navigation }) {
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Settori Colpiti</Text>
             <View style={styles.categoryGrid}>
-              {Object.entries(categoryData)
-                .sort((a, b) => b[1] - a[1])
-                .slice(0, 8)
-                .map(([cat, count]) => (
+              {sortedCategories.map(([cat, count]) => (
                   <TouchableOpacity
                     key={cat}
                     style={styles.categoryCard}
-                    onPress={() => {
-                      navigation.navigate('Feed', {
-                        screen: 'FeedList',
-                        params: { category: cat },
-                      });
-                    }}
+                    onPress={() => handleCategoryPress(cat)}
                   >
                     <Ionicons
                       name={categoryIcon(cat)}
@@ -184,12 +204,7 @@ export default function HomeScreen({ navigation }) {
               <TouchableOpacity
                 key={article.id}
                 style={styles.recentArticle}
-                onPress={() =>
-                  navigation.navigate('Feed', {
-                    screen: 'ArticleDetail',
-                    params: { articleId: article.id, title: article.title },
-                  })
-                }
+                onPress={() => handleArticlePress(article)}
               >
                 <View style={styles.recentArticleHeader}>
                   <View

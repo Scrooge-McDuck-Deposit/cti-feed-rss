@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     # AI Engine: "ollama", "gemini", "openai" o "" (disabilitato)
-    AI_ENGINE: str = ""
+    AI_ENGINE: str = "ollama"
 
     # Ollama (locale, gratuito — https://ollama.com)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     # Server
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+
+    # SOC Integrations
+    THEHIVE_URL: str = ""
+    THEHIVE_API_KEY: str = ""
+    QRADAR_URL: str = ""
+    QRADAR_API_KEY: str = ""
+    ELASTICSEARCH_URL: str = ""
+    ELASTICSEARCH_API_KEY: str = ""
 
     class Config:
         env_file = ".env"

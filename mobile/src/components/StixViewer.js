@@ -2,12 +2,13 @@
  * Visualizzatore STIX bundle con elenco oggetti e vista JSON.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useMemo, useCallback } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   ScrollView,
+  FlatList,
   TouchableOpacity,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -61,6 +62,21 @@ function StixObjectCard({ obj }) {
 export default function StixViewer({ bundle }) {
   const [showJson, setShowJson] = useState(false);
 
+  const objects = useMemo(() => bundle?.objects || [], [bundle]);
+  const typeCounts = useMemo(() => {
+    const counts = {};
+    objects.forEach((o) => {
+      counts[o.type] = (counts[o.type] || 0) + 1;
+    });
+    return counts;
+  }, [objects]);
+
+  const renderStixObject = useCallback(
+    ({ item }) => <StixObjectCard obj={item} />,
+    []
+  );
+  const keyExtractor = useCallback((item, i) => item.id || String(i), []);
+
   if (!bundle || !bundle.objects) {
     return (
       <View style={styles.empty}>
@@ -69,12 +85,6 @@ export default function StixViewer({ bundle }) {
       </View>
     );
   }
-
-  const objects = bundle.objects || [];
-  const typeCounts = {};
-  objects.forEach((o) => {
-    typeCounts[o.type] = (typeCounts[o.type] || 0) + 1;
-  });
 
   return (
     <View style={styles.container}>
@@ -106,7 +116,7 @@ export default function StixViewer({ bundle }) {
         ))}
       </View>
 
-      {/* Content */}
+      {/* Content — virtualized list for performance */}
       {showJson ? (
         <ScrollView horizontal style={styles.fullJson}>
           <Text style={styles.jsonText}>
@@ -114,7 +124,16 @@ export default function StixViewer({ bundle }) {
           </Text>
         </ScrollView>
       ) : (
-        objects.map((obj, i) => <StixObjectCard key={obj.id || i} obj={obj} />)
+        <FlatList
+          data={objects}
+          renderItem={renderStixObject}
+          keyExtractor={keyExtractor}
+          scrollEnabled={false}
+          initialNumToRender={10}
+          maxToRenderPerBatch={10}
+          windowSize={5}
+          contentContainerStyle={{ gap: spacing.sm }}
+        />
       )}
     </View>
   );

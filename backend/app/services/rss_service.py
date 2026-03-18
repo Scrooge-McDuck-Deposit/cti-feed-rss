@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from datetime import datetime
@@ -17,12 +18,18 @@ from app.models.schemas import Article, ArticleStatus, FeedSource
 
 logger = logging.getLogger(__name__)
 
+# Concurrency limit for parallel feed fetching
+_FETCH_SEMAPHORE_LIMIT = 20
+_MAX_RETRIES = 2
+_RETRY_BACKOFF_BASE = 1.5  # seconds
+
 
 class RSSService:
     """Gestisce il fetching e il parsing dei feed RSS."""
 
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
+        self._semaphore = asyncio.Semaphore(_FETCH_SEMAPHORE_LIMIT)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -108,53 +115,67 @@ class RSSService:
         )
 
     async def fetch_feed(self, feed: FeedSource) -> list[Article]:
-        """Fetcha e parsa un singolo feed RSS."""
+        """Fetcha e parsa un singolo feed RSS con retry e semaphore."""
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return await self._fetch_feed_once(feed)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < _MAX_RETRIES:
+                    wait = _RETRY_BACKOFF_BASE ** (attempt + 1)
+                    logger.warning(
+                        "Retry %d/%d for %s (wait %.1fs): %s",
+                        attempt + 1, _MAX_RETRIES, feed.name, wait, e,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error("Failed after %d retries for %s: %s", _MAX_RETRIES, feed.name, e)
+            except Exception as e:
+                logger.error("Unexpected error fetching %s: %s", feed.name, e)
+                break
+        return []
+
+    async def _fetch_feed_once(self, feed: FeedSource) -> list[Article]:
+        """Single fetch attempt for a feed, rate-limited by semaphore."""
         articles: list[Article] = []
-        try:
+        async with self._semaphore:
             session = await self._get_session()
             async with session.get(feed.url) as response:
                 if response.status != 200:
-                    logger.warning(
-                        "Feed %s returned status %d", feed.name, response.status
-                    )
+                    logger.warning("Feed %s returned status %d", feed.name, response.status)
                     return articles
 
                 content = await response.text()
-                parsed = feedparser.parse(content)
 
-                if parsed.bozo and not parsed.entries:
-                    logger.warning(
-                        "Feed %s parsing error: %s", feed.name, parsed.bozo_exception
-                    )
-                    return articles
+        parsed = feedparser.parse(content)
 
-                for entry in parsed.entries[: settings.MAX_ARTICLES_PER_FEED]:
-                    try:
-                        article = self._parse_entry(entry, feed.id)
-                        articles.append(article)
-                    except Exception as e:
-                        logger.error(
-                            "Error parsing entry from %s: %s", feed.name, str(e)
-                        )
-                        continue
+        if parsed.bozo and not parsed.entries:
+            logger.warning("Feed %s parsing error: %s", feed.name, parsed.bozo_exception)
+            return articles
 
-            logger.info("Fetched %d articles from %s", len(articles), feed.name)
+        for entry in parsed.entries[: settings.MAX_ARTICLES_PER_FEED]:
+            try:
+                article = self._parse_entry(entry, feed.id)
+                articles.append(article)
+            except Exception as e:
+                logger.error("Error parsing entry from %s: %s", feed.name, str(e))
+                continue
 
-        except aiohttp.ClientError as e:
-            logger.error("Network error fetching %s: %s", feed.name, str(e))
-        except Exception as e:
-            logger.error("Unexpected error fetching %s: %s", feed.name, str(e))
-
+        logger.info("Fetched %d articles from %s", len(articles), feed.name)
         return articles
 
     async def fetch_all_feeds(self) -> list[Article]:
-        """Fetcha tutti i feed attivi."""
+        """Fetcha tutti i feed attivi in parallelo con asyncio.gather."""
         feeds = get_enabled_feeds()
-        all_articles: list[Article] = []
 
-        for feed in feeds:
-            articles = await self.fetch_feed(feed)
-            all_articles.extend(articles)
+        tasks = [self.fetch_feed(feed) for feed in feeds]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_articles: list[Article] = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error("Feed %s raised exception: %s", feeds[i].name, result)
+            elif isinstance(result, list):
+                all_articles.extend(result)
 
         logger.info("Total articles fetched: %d from %d feeds", len(all_articles), len(feeds))
         return all_articles

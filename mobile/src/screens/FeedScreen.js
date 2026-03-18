@@ -2,7 +2,7 @@
  * Schermata Feed - lista articoli con filtri e ricerca.
  */
 
-import React, { useEffect, useCallback, useState } from 'react';
+import React, { useEffect, useCallback, useState, useRef } from 'react';
 import {
   View,
   Text,
@@ -19,6 +19,8 @@ import useStore from '../store/ArticleStore';
 import ArticleCard from '../components/ArticleCard';
 import CategoryBadge from '../components/CategoryBadge';
 import { colors, spacing, fontSize, borderRadius } from '../theme';
+
+const SEARCH_DEBOUNCE_MS = 500;
 
 export default function FeedScreen({ navigation, route }) {
   const {
@@ -38,6 +40,7 @@ export default function FeedScreen({ navigation, route }) {
 
   const [searchText, setSearchText] = useState('');
   const [showFilterModal, setShowFilterModal] = useState(false);
+  const searchTimer = useRef(null);
 
   // Gestisci parametri da navigazione (es. click su categoria dalla dashboard)
   useEffect(() => {
@@ -46,9 +49,21 @@ export default function FeedScreen({ navigation, route }) {
     }
   }, [route.params?.category]);
 
-  const handleSearch = useCallback(() => {
-    setFilter('search', searchText);
-  }, [searchText]);
+  // Debounced search
+  const handleSearchChange = useCallback((text) => {
+    setSearchText(text);
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => {
+      setFilter('search', text);
+    }, SEARCH_DEBOUNCE_MS);
+  }, [setFilter]);
+
+  // Cleanup timer on unmount
+  useEffect(() => {
+    return () => {
+      if (searchTimer.current) clearTimeout(searchTimer.current);
+    };
+  }, []);
 
   const handleArticlePress = useCallback(
     (article) => {
@@ -108,14 +123,14 @@ export default function FeedScreen({ navigation, route }) {
             placeholder="Cerca articoli..."
             placeholderTextColor={colors.textMuted}
             value={searchText}
-            onChangeText={setSearchText}
-            onSubmitEditing={handleSearch}
+            onChangeText={handleSearchChange}
             returnKeyType="search"
           />
           {searchText.length > 0 && (
             <TouchableOpacity
               onPress={() => {
                 setSearchText('');
+                if (searchTimer.current) clearTimeout(searchTimer.current);
                 setFilter('search', '');
               }}
             >

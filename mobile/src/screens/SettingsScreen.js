@@ -12,6 +12,7 @@ import {
   TouchableOpacity,
   Switch,
   Alert,
+  ActivityIndicator,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import useStore from '../store/ArticleStore';
@@ -20,16 +21,45 @@ import { colors, spacing, fontSize, borderRadius } from '../theme';
 import { formatBytes } from '../utils/helpers';
 
 export default function SettingsScreen() {
-  const { settings, updateSettings, feeds, aiStatus, loadAiStatus, importOpml } = useStore();
+  const {
+    settings, updateSettings, feeds, aiStatus, aiConfig,
+    loadAiStatus, loadAiConfig, updateAiConfig, testAiConnection, importOpml,
+  } = useStore();
   const [apiUrl, setApiUrl] = useState(settings.apiUrl);
   const [cacheInfo, setCacheInfo] = useState(null);
   const [opmlUrl, setOpmlUrl] = useState('');
   const [importing, setImporting] = useState(false);
 
+  // AI config local state
+  const [selectedEngine, setSelectedEngine] = useState('ollama');
+  const [ollamaUrl, setOllamaUrl] = useState('http://localhost:11434');
+  const [ollamaModel, setOllamaModel] = useState('llama3');
+  const [geminiKey, setGeminiKey] = useState('');
+  const [geminiModel, setGeminiModel] = useState('gemini-2.0-flash');
+  const [openaiKey, setOpenaiKey] = useState('');
+  const [openaiModel, setOpenaiModel] = useState('gpt-4o');
+  const [savingAi, setSavingAi] = useState(false);
+  const [testingAi, setTestingAi] = useState(false);
+
   useEffect(() => {
     loadCacheInfo();
     loadAiStatus();
+    loadAiConfig().then(() => {
+      // Sync local state once config is loaded
+    });
   }, []);
+
+  // Sync local AI state when aiConfig loads from backend
+  useEffect(() => {
+    if (aiConfig) {
+      setSelectedEngine(aiConfig.engine || 'ollama');
+      if (aiConfig.ollama_base_url) setOllamaUrl(aiConfig.ollama_base_url);
+      if (aiConfig.ollama_model) setOllamaModel(aiConfig.ollama_model);
+      if (aiConfig.gemini_model) setGeminiModel(aiConfig.gemini_model);
+      if (aiConfig.openai_model) setOpenaiModel(aiConfig.openai_model);
+      // Keys are not returned from backend for security; keep local state
+    }
+  }, [aiConfig]);
 
   const loadCacheInfo = async () => {
     const info = await cacheService.getCacheSize();
@@ -84,6 +114,44 @@ export default function SettingsScreen() {
       setImporting(false);
     }
   }, [opmlUrl]);
+
+  const handleSaveAiConfig = useCallback(async () => {
+    setSavingAi(true);
+    try {
+      const config = { engine: selectedEngine };
+      if (selectedEngine === 'ollama') {
+        config.ollama_base_url = ollamaUrl;
+        config.ollama_model = ollamaModel;
+      } else if (selectedEngine === 'gemini') {
+        config.gemini_model = geminiModel;
+        if (geminiKey) config.gemini_api_key = geminiKey;
+      } else if (selectedEngine === 'openai') {
+        config.openai_model = openaiModel;
+        if (openaiKey) config.openai_api_key = openaiKey;
+      }
+      await updateAiConfig(config);
+      Alert.alert('Salvato', 'Configurazione AI aggiornata');
+    } catch (error) {
+      Alert.alert('Errore', error.message || 'Impossibile salvare la configurazione');
+    } finally {
+      setSavingAi(false);
+    }
+  }, [selectedEngine, ollamaUrl, ollamaModel, geminiKey, geminiModel, openaiKey, openaiModel]);
+
+  const handleTestAi = useCallback(async () => {
+    setTestingAi(true);
+    try {
+      const result = await testAiConnection();
+      Alert.alert(
+        result.success ? 'Connessione riuscita' : 'Connessione fallita',
+        result.message,
+      );
+    } catch (error) {
+      Alert.alert('Errore', error.message || 'Test fallito');
+    } finally {
+      setTestingAi(false);
+    }
+  }, []);
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
@@ -178,16 +246,18 @@ export default function SettingsScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* AI Status */}
+      {/* AI Configuration */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Intelligenza Artificiale</Text>
+
+        {/* Status indicator */}
         <View style={styles.settingRow}>
           <View style={styles.settingInfo}>
             <Text style={styles.settingLabel}>Stato AI</Text>
             <Text style={styles.settingHint}>
               {aiStatus?.available
                 ? `${aiStatus.engine_label || aiStatus.engine} — ${aiStatus.model}`
-                : aiStatus?.message || 'Verifica in corso...'}
+                : 'Non configurato (analisi base attiva)'}
             </Text>
           </View>
           <View style={[
@@ -195,11 +265,160 @@ export default function SettingsScreen() {
             { backgroundColor: aiStatus?.available ? colors.success : colors.warning }
           ]} />
         </View>
-        {!aiStatus?.available && (
-          <Text style={styles.hint}>
-            L'app funziona senza AI con categorizzazione base ed estrazione IoC regex. Per abilitare l'AI configura AI_ENGINE nel backend: Ollama (gratis, locale), Gemini (gratis con limiti), o OpenAI (a pagamento).
-          </Text>
+
+        {/* Engine selector */}
+        <Text style={styles.fieldLabel}>Motore AI</Text>
+        <View style={styles.engineSelector}>
+          {[
+            { id: 'ollama', label: 'Ollama', desc: 'Locale, gratuito', icon: 'hardware-chip-outline' },
+            { id: 'gemini', label: 'Gemini', desc: 'Google, gratis con limiti', icon: 'sparkles-outline' },
+            { id: 'openai', label: 'OpenAI', desc: 'A pagamento', icon: 'key-outline' },
+          ].map((eng) => (
+            <TouchableOpacity
+              key={eng.id}
+              style={[
+                styles.engineOption,
+                selectedEngine === eng.id && styles.engineOptionActive,
+              ]}
+              onPress={() => setSelectedEngine(eng.id)}
+            >
+              <Ionicons
+                name={eng.icon}
+                size={20}
+                color={selectedEngine === eng.id ? colors.primary : colors.textMuted}
+              />
+              <Text style={[
+                styles.engineLabel,
+                selectedEngine === eng.id && styles.engineLabelActive,
+              ]}>
+                {eng.label}
+              </Text>
+              <Text style={styles.engineDesc}>{eng.desc}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        {/* Ollama settings */}
+        {selectedEngine === 'ollama' && (
+          <View style={styles.engineConfig}>
+            <Text style={styles.fieldLabel}>URL Ollama</Text>
+            <TextInput
+              style={styles.input}
+              value={ollamaUrl}
+              onChangeText={setOllamaUrl}
+              placeholder="http://localhost:11434"
+              placeholderTextColor={colors.textMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text style={styles.fieldLabel}>Modello</Text>
+            <TextInput
+              style={styles.input}
+              value={ollamaModel}
+              onChangeText={setOllamaModel}
+              placeholder="llama3"
+              placeholderTextColor={colors.textMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text style={styles.hint}>
+              Installa Ollama da ollama.com, poi esegui: ollama pull {ollamaModel}
+            </Text>
+          </View>
         )}
+
+        {/* Gemini settings */}
+        {selectedEngine === 'gemini' && (
+          <View style={styles.engineConfig}>
+            <Text style={styles.fieldLabel}>API Key</Text>
+            <TextInput
+              style={styles.input}
+              value={geminiKey}
+              onChangeText={setGeminiKey}
+              placeholder={aiConfig?.gemini_api_key_set ? '••••••••  (già configurata)' : 'Inserisci la tua API key'}
+              placeholderTextColor={colors.textMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              secureTextEntry
+            />
+            <Text style={styles.fieldLabel}>Modello</Text>
+            <TextInput
+              style={styles.input}
+              value={geminiModel}
+              onChangeText={setGeminiModel}
+              placeholder="gemini-2.0-flash"
+              placeholderTextColor={colors.textMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text style={styles.hint}>
+              Ottieni una API key gratuita su aistudio.google.com/apikey
+            </Text>
+          </View>
+        )}
+
+        {/* OpenAI settings */}
+        {selectedEngine === 'openai' && (
+          <View style={styles.engineConfig}>
+            <Text style={styles.fieldLabel}>API Key</Text>
+            <TextInput
+              style={styles.input}
+              value={openaiKey}
+              onChangeText={setOpenaiKey}
+              placeholder={aiConfig?.openai_api_key_set ? '••••••••  (già configurata)' : 'sk-...'}
+              placeholderTextColor={colors.textMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              secureTextEntry
+            />
+            <Text style={styles.fieldLabel}>Modello</Text>
+            <TextInput
+              style={styles.input}
+              value={openaiModel}
+              onChangeText={setOpenaiModel}
+              placeholder="gpt-4o"
+              placeholderTextColor={colors.textMuted}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text style={styles.hint}>
+              Richiede un account OpenAI con credito. Modelli: gpt-4o, gpt-4o-mini
+            </Text>
+          </View>
+        )}
+
+        {/* Action buttons */}
+        <View style={styles.aiActions}>
+          <TouchableOpacity
+            style={[styles.aiSaveButton, savingAi && { opacity: 0.6 }]}
+            onPress={handleSaveAiConfig}
+            disabled={savingAi}
+          >
+            {savingAi ? (
+              <ActivityIndicator size="small" color={colors.white} />
+            ) : (
+              <Ionicons name="save-outline" size={18} color={colors.white} />
+            )}
+            <Text style={styles.aiSaveButtonText}>
+              {savingAi ? 'Salvataggio...' : 'Salva Configurazione'}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.aiTestButton, testingAi && { opacity: 0.6 }]}
+            onPress={handleTestAi}
+            disabled={testingAi}
+          >
+            {testingAi ? (
+              <ActivityIndicator size="small" color={colors.primary} />
+            ) : (
+              <Ionicons name="flash-outline" size={18} color={colors.primary} />
+            )}
+            <Text style={styles.aiTestButtonText}>
+              {testingAi ? 'Test...' : 'Testa Connessione'}
+            </Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* OPML Import */}
@@ -445,5 +664,84 @@ const styles = StyleSheet.create({
     fontSize: fontSize.md,
     color: colors.text,
     fontWeight: '500',
+  },
+  // AI Configuration
+  fieldLabel: {
+    fontSize: fontSize.sm,
+    fontWeight: '500',
+    color: colors.textSecondary,
+    marginTop: spacing.md,
+    marginBottom: spacing.xs,
+  },
+  engineSelector: {
+    gap: spacing.sm,
+  },
+  engineOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    padding: spacing.lg,
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  engineOptionActive: {
+    borderColor: colors.primary,
+    backgroundColor: colors.primary + '10',
+  },
+  engineLabel: {
+    fontSize: fontSize.md,
+    fontWeight: '600',
+    color: colors.text,
+  },
+  engineLabelActive: {
+    color: colors.primary,
+  },
+  engineDesc: {
+    flex: 1,
+    fontSize: fontSize.sm,
+    color: colors.textMuted,
+    textAlign: 'right',
+  },
+  engineConfig: {
+    marginTop: spacing.sm,
+  },
+  aiActions: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+    marginTop: spacing.lg,
+  },
+  aiSaveButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.primary,
+    borderRadius: borderRadius.md,
+    paddingVertical: spacing.md,
+  },
+  aiSaveButtonText: {
+    color: colors.white,
+    fontSize: fontSize.md,
+    fontWeight: '600',
+  },
+  aiTestButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    paddingVertical: spacing.md,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  aiTestButtonText: {
+    color: colors.primary,
+    fontSize: fontSize.md,
+    fontWeight: '600',
   },
 });
